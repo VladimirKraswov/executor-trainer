@@ -9,6 +9,9 @@ from typing import Dict, Optional, Tuple
 
 import requests
 
+from ..pipeline.utils import retry
+
+logger = logging.getLogger(__name__)
 
 def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tuple[float, float]:
     try:
@@ -16,8 +19,8 @@ def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tup
     except Exception:
         value = fallback
 
-    read_timeout = max(1.0, min(value, 5.0))
-    connect_timeout = 2.0
+    read_timeout = max(1.0, min(value, 30.0)) # Increased max read timeout
+    connect_timeout = 5.0
     return connect_timeout, read_timeout
 
 
@@ -29,6 +32,7 @@ class LogStreamer(logging.Handler):
         job_name: str,
         bearer_token: Optional[str] = None,
         timeout_sec: int = 5,
+        max_queue_size: int = 5000,
     ):
         super().__init__()
         self.logs_url = str(logs_url or "").strip()
@@ -45,7 +49,7 @@ class LogStreamer(logging.Handler):
         if bearer_token:
             self.headers["Authorization"] = f"Bearer {bearer_token}"
 
-        self._queue: queue.Queue[dict] = queue.Queue(maxsize=2000)
+        self._queue: queue.Queue[dict] = queue.Queue(maxsize=max_queue_size)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -55,16 +59,21 @@ class LogStreamer(logging.Handler):
         self._worker.start()
 
     def _deliver(self, payload: dict) -> None:
-        response = self.session.post(
-            self.logs_url,
-            json=payload,
-            headers=self.headers,
-            timeout=_safe_timeout(self.timeout_sec, 3.0),
-        )
-        response.raise_for_status()
+        @retry(tries=5, delay=1, backoff=2) # More retries for log streaming
+        def _post():
+            response = self.session.post(
+                self.logs_url,
+                json=payload,
+                headers=self.headers,
+                timeout=_safe_timeout(self.timeout_sec, 5.0),
+            )
+            response.raise_for_status()
+
+        _post()
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set() or not self._queue.empty():
+            # Batch logs if possible? For now, keep it simple but more resilient
             try:
                 payload = self._queue.get(timeout=0.2)
             except queue.Empty:
@@ -74,7 +83,7 @@ class LogStreamer(logging.Handler):
                 self._deliver(payload)
             except Exception as exc:
                 try:
-                    sys.stderr.write(f"[log-streamer] failed to send log chunk: {exc}\n")
+                    sys.stderr.write(f"[log-streamer] FATAL: failed to send log chunk after retries: {exc}\n")
                     sys.stderr.flush()
                 except Exception:
                     pass
@@ -83,6 +92,10 @@ class LogStreamer(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Add context to log message if possible
+            record.job_id = self.job_id
+            record.job_name = self.job_name
+
             message = self.format(record)
             if not message:
                 return
@@ -99,6 +112,8 @@ class LogStreamer(logging.Handler):
                 "job_name": self.job_name,
                 "offset": current_offset,
                 "chunk": chunk,
+                "timestamp": record.created,
+                "level": record.levelname,
             }
 
             try:
@@ -125,9 +140,9 @@ class LogStreamer(logging.Handler):
 
     def close(self) -> None:
         try:
-            self.flush(timeout_sec=2.0)
+            self.flush(timeout_sec=5.0)
             self._stop_event.set()
-            self._worker.join(timeout=2.0)
+            self._worker.join(timeout=5.0)
         finally:
             try:
                 self.session.close()

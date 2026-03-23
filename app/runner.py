@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import gc
 import json
 import logging
 import sys
@@ -22,6 +21,7 @@ from .bootstrap.config_loader import load_config, load_config_bundle
 from .pipeline.asset_manager import AssetManager
 from .pipeline.publish_runner import PublishRunner
 from .pipeline.upload_runner import UploadRunner
+from .pipeline.utils import cleanup_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -104,11 +104,11 @@ def teardown_logging(handlers: List[logging.Handler]) -> None:
             pass
 
 
-def start_heartbeat(reporter: Reporter) -> Tuple[Event, Thread]:
+def start_heartbeat(reporter: Reporter, interval: int = 30) -> Tuple[Event, Thread]:
     stop_event = Event()
 
     def heartbeat_loop():
-        while not stop_event.wait(30):
+        while not stop_event.wait(interval):
             try:
                 reporter.report_status(
                     "running",
@@ -132,6 +132,280 @@ def stop_heartbeat(stop_event: Optional[Event], thread: Optional[Thread]) -> Non
             thread.join(timeout=1.0)
         except Exception:
             pass
+
+
+def apply_run_output_paths(cfg) -> Tuple[str, Path]:
+    run_name = f"{cfg.job_name}_{utc_compact_timestamp()}"
+    base_root = Path(cfg.outputs.base_dir)
+    run_root = base_root / run_name
+
+    cfg.outputs.base_dir = str(run_root)
+    cfg.outputs.logs_dir = str(run_root / "logs")
+    cfg.outputs.lora_dir = str(run_root / "lora")
+    cfg.outputs.checkpoints_dir = str(run_root / "checkpoints")
+    cfg.outputs.metrics_dir = str(run_root / "metrics")
+    cfg.outputs.merged_dir = str(run_root / "merged")
+    cfg.outputs.quantized_dir = str(run_root / "quantized")
+    cfg.outputs.eval_dir = str(run_root / "evaluation")
+    cfg.outputs.downloads_dir = str(run_root / "downloads")
+
+    return run_name, run_root
+
+
+class Pipeline:
+    def __init__(self, cfg: Any, config_source: str, bootstrap_meta: Optional[Dict[str, Any]] = None):
+        self.cfg = copy.deepcopy(cfg)
+        self.config_source = config_source
+        self.bootstrap_meta = bootstrap_meta or {}
+        self.run_name, self.run_root = apply_run_output_paths(self.cfg)
+
+        # Override config reporting with bootstrap meta if present
+        if self.bootstrap_meta.get("status_url"):
+            self.cfg.reporting.status.url = self.bootstrap_meta["status_url"]
+            self.cfg.reporting.status.enabled = True
+        if self.bootstrap_meta.get("progress_url"):
+            self.cfg.reporting.progress.url = self.bootstrap_meta["progress_url"]
+            self.cfg.reporting.progress.enabled = True
+        if self.bootstrap_meta.get("final_url"):
+            self.cfg.reporting.final.url = self.bootstrap_meta["final_url"]
+            self.cfg.reporting.final.enabled = True
+        if self.bootstrap_meta.get("logs_url"):
+            self.cfg.reporting.logs.url = self.bootstrap_meta["logs_url"]
+            self.cfg.reporting.logs.enabled = True
+
+        auth_token = self.bootstrap_meta.get("callback_auth_token")
+        if auth_token:
+            for cb in [self.cfg.reporting.status, self.cfg.reporting.progress, self.cfg.reporting.final, self.cfg.reporting.logs]:
+                if not cb.auth.bearer_token:
+                    cb.auth.bearer_token = auth_token
+
+        self.log_file, self.log_handlers = setup_logging(
+            self.cfg.outputs.logs_dir,
+            job_id=self.cfg.job_id or self.cfg.job_name,
+            job_name=self.cfg.job_name,
+            logs_url=self.cfg.reporting.logs.url if self.cfg.reporting.logs.enabled else None,
+            logs_bearer_token=self.cfg.reporting.logs.auth.bearer_token,
+        )
+
+        self.reporter = Reporter(self.cfg)
+        self.asset_manager = AssetManager(self.cfg)
+        self.uploader = UploadRunner(self.cfg)
+        self.publisher = PublishRunner(self.cfg)
+
+        self.heartbeat_stop, self.heartbeat_thread = start_heartbeat(
+            self.reporter,
+            interval=self.cfg.reporting.heartbeat_interval
+        )
+
+        self.effective_config_path = Path(self.cfg.outputs.logs_dir) / "effective-job.json"
+        self.result_path = Path(self.cfg.outputs.base_dir) / "job-result.json"
+
+        self.started_at = utc_now_iso()
+        self.training_result: Dict[str, Any] = {}
+        self.evaluation_result: Optional[Dict[str, Any]] = None
+        self.result: Dict[str, Any] = {
+            "status": "started",
+            "job_id": self.cfg.job_id or self.cfg.job_name,
+            "job_name": self.cfg.job_name,
+            "run_name": self.run_name,
+            "started_at": self.started_at,
+            "finished_at": None,
+            "config_source": self.config_source,
+            "training": {},
+            "evaluation": None,
+            "artifacts": {
+                "run_root": str(self.run_root),
+                "log_file": str(self.log_file),
+                "effective_config_path": str(self.effective_config_path),
+                "result_path": str(self.result_path),
+            },
+            "uploads": {},
+            "upload_errors": {},
+            "externalRefs": [],
+        }
+
+    def run(self) -> Dict[str, Any]:
+        try:
+            self.reporter.report_status(
+                "started",
+                message="Training pipeline started",
+                stage="bootstrap",
+                progress=0,
+            )
+
+            write_json(self.effective_config_path, json.loads(self.cfg.model_dump_json()))
+            logger.info("==> config loaded")
+            logger.info("==> job_name: %s", self.cfg.job_name)
+            logger.info("==> run_name: %s", self.run_name)
+            logger.info("==> job_id: %s", self.cfg.job_id or self.cfg.job_name)
+            logger.info("==> config source: %s", self.config_source)
+            logger.info("==> run output dir: %s", self.run_root)
+
+            self.reporter.report_status(
+                "running",
+                message="Validating Hugging Face access",
+                stage="hf_login",
+                progress=2,
+            )
+            try_hf_login()
+            self.publisher.ensure_hf_ready()
+
+            pipeline_cfg = self.cfg.pipeline
+            has_steps = bool(pipeline_cfg and pipeline_cfg.steps)
+
+            if has_steps:
+                logger.info("==> executing pipeline steps")
+                for step in pipeline_cfg.steps:
+                    if step.enabled:
+                        self._execute_step(step.key, step.kind)
+                    else:
+                        logger.info("==> step %s disabled, skipping", step.key)
+            else:
+                logger.warning("==> pipeline.steps missing, falling back to legacy sequence")
+                self._run_legacy_sequence()
+
+            self._finalize_success()
+            return self.result
+
+        except Exception as exc:
+            return self._handle_error(exc)
+        finally:
+            self._cleanup()
+
+    def _execute_step(self, step_key: str, step_kind: str) -> None:
+        logger.info("==> running step: %s (kind: %s)", step_key, step_kind)
+
+        if step_kind == "prepare_assets":
+            self.reporter.report_status("running", message="Preparing assets", stage="prepare_assets", progress=5)
+            self.asset_manager.prepare_dataset(self.cfg)
+            self.asset_manager.prepare_evaluation_dataset(self.cfg)
+            cleanup_runtime("prepare-assets")
+
+        elif step_kind == "training":
+            from .pipeline.train_runner import run_training
+            self.training_result = run_training(self.cfg, reporter=self.reporter)
+            if self.cfg.model.logical_base_model_id and not self.training_result.get("base_model_id"):
+                self.training_result["base_model_id"] = self.cfg.model.logical_base_model_id
+            self.result["training"] = self.training_result
+            cleanup_runtime("training")
+
+        elif step_kind == "evaluation":
+            from .pipeline.eval_runner import run_evaluation
+            cleanup_runtime("pre-evaluation")
+            try:
+                self.evaluation_result = run_evaluation(self.cfg, self.training_result, reporter=self.reporter)
+                self.result["evaluation"] = self.evaluation_result
+            except Exception as e:
+                logger.error("Evaluation failed but continuing: %s", e)
+                self.result["evaluation_error"] = str(e)
+            cleanup_runtime("evaluation")
+
+        elif step_kind == "publish_hf":
+            self.reporter.report_status("running", message="Publishing to HF", stage="publish", progress=90)
+            try:
+                hf_model_uploads = self.publisher.upload_to_huggingface(self.training_result)
+                if hf_model_uploads:
+                    self.result["uploads"].update(hf_model_uploads)
+
+                hf_metadata_uploads = self.publisher.upload_hf_metadata(
+                    log_file=str(self.log_file),
+                    effective_config_path=str(self.effective_config_path),
+                    result_path=str(self.result_path),
+                    training_result=self.training_result,
+                    eval_result=self.evaluation_result,
+                )
+                if hf_metadata_uploads:
+                    self.result["uploads"].update(hf_metadata_uploads)
+            except Exception as e:
+                logger.error("Publishing to HF failed but continuing: %s", e)
+                self.result["upload_errors"]["huggingface"] = str(e)
+            cleanup_runtime("publish")
+
+        elif step_kind == "upload_artifacts":
+            self.reporter.report_status("running", message="Uploading artifacts", stage="upload", progress=95)
+            try:
+                extra_uploads, extra_upload_errors = self.uploader.upload_non_summary_artifacts(
+                    log_file=str(self.log_file),
+                    effective_config_path=str(self.effective_config_path),
+                    training_result=self.training_result,
+                    eval_result=self.evaluation_result,
+                )
+                if extra_uploads:
+                    self.result["uploads"].update(extra_uploads)
+                if extra_upload_errors:
+                    self.result["upload_errors"].update(extra_upload_errors)
+            except Exception as e:
+                logger.error("Uploading artifacts failed but continuing: %s", e)
+                self.result["upload_errors"]["artifacts"] = str(e)
+            cleanup_runtime("upload")
+
+    def _run_legacy_sequence(self) -> None:
+        p = self.cfg.pipeline
+        if not p or p.prepare_assets.enabled:
+            self._execute_step("prepare_assets", "prepare_assets")
+        if not p or p.training.enabled:
+            self._execute_step("training", "training")
+        if (p.evaluation.enabled if p else self.cfg.evaluation.enabled):
+            self._execute_step("evaluation", "evaluation")
+        if (p.publish.enabled if p else self.cfg.huggingface.enabled):
+            self._execute_step("publish", "publish_hf")
+        if (p.upload.enabled if p else self.cfg.upload.enabled):
+            self._execute_step("upload", "upload_artifacts")
+
+    def _finalize_success(self) -> None:
+        self.result["finished_at"] = utc_now_iso()
+        self.result["status"] = "success"
+        write_json(self.result_path, self.result)
+
+        p = self.cfg.pipeline
+        should_upload = p.upload.enabled if p else self.cfg.upload.enabled
+        if should_upload and self.cfg.upload.target == "url" and self.cfg.upload.url_targets.summary_url:
+            try:
+                summary_upload = self.uploader.upload_summary(str(self.result_path))
+                if summary_upload:
+                    self.result["uploads"].update(summary_upload)
+                    write_json(self.result_path, self.result)
+            except Exception as exc:
+                logger.exception("summary upload failed")
+                self.result["upload_errors"]["summary"] = str(exc)
+                write_json(self.result_path, self.result)
+
+        if self.result["upload_errors"]:
+            logger.warning("==> pipeline finished with upload warnings")
+
+        logger.info("==> pipeline finished successfully")
+        self.reporter.report_status(
+            "finished",
+            message="Training pipeline finished successfully",
+            stage="finished",
+            progress=100,
+        )
+        self.reporter.report_final(self.result, status="finished")
+
+    def _handle_error(self, exc: Exception) -> Dict[str, Any]:
+        error_msg = str(exc)
+        stack_trace = traceback.format_exc()
+
+        logger.error("FATAL ERROR: %s", error_msg)
+        logger.error(stack_trace)
+
+        self.result["status"] = "failed"
+        self.result["finished_at"] = utc_now_iso()
+        self.result["error"] = error_msg
+        write_json(self.result_path, self.result)
+
+        self.reporter.report_error(error_msg, logs=tail_file(self.log_file, 50))
+        self.reporter.report_final(self.result, status="failed")
+        return self.result
+
+    def _cleanup(self) -> None:
+        stop_heartbeat(self.heartbeat_stop, self.heartbeat_thread)
+        try:
+            self.reporter.close()
+        except Exception:
+            pass
+        teardown_logging(self.log_handlers)
+        cleanup_runtime("job-finalize")
 
 
 def resolve_single_remote_config(args) -> Tuple[Any, str, Dict[str, Any]]:
@@ -158,319 +432,10 @@ def resolve_config_list(args) -> Tuple[List[Any], str]:
     raise ValueError("Either --config or --job-config-url must be provided")
 
 
-def apply_run_output_paths(cfg) -> Tuple[str, Path]:
-    run_name = f"{cfg.job_name}_{utc_compact_timestamp()}"
-    base_root = Path(cfg.outputs.base_dir)
-    run_root = base_root / run_name
-
-    cfg.outputs.base_dir = str(run_root)
-    cfg.outputs.logs_dir = str(run_root / "logs")
-    cfg.outputs.lora_dir = str(run_root / "lora")
-    cfg.outputs.checkpoints_dir = str(run_root / "checkpoints")
-    cfg.outputs.metrics_dir = str(run_root / "metrics")
-    cfg.outputs.merged_dir = str(run_root / "merged")
-    cfg.outputs.quantized_dir = str(run_root / "quantized")
-    cfg.outputs.eval_dir = str(run_root / "evaluation")
-    cfg.outputs.downloads_dir = str(run_root / "downloads")
-
-    return run_name, run_root
-
-
-def cleanup_runtime(stage: str | None = None) -> None:
-    if stage:
-        logger.info("==> cleaning runtime after %s", stage)
-
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-    try:
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            try:
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
 def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    bootstrap_meta = bootstrap_meta or {}
-    cfg = copy.deepcopy(cfg)
-
     cleanup_runtime("previous-job")
-
-    run_name, run_root = apply_run_output_paths(cfg)
-    Path(cfg.outputs.base_dir).mkdir(parents=True, exist_ok=True)
-
-    log_file, handlers = setup_logging(
-        cfg.outputs.logs_dir,
-        job_id=cfg.job_id or cfg.job_name,
-        job_name=cfg.job_name,
-        logs_url=bootstrap_meta.get("logs_url") or cfg.reporting.logs.url,
-        logs_bearer_token=(
-            bootstrap_meta.get("callback_auth_token")
-            or cfg.reporting.logs.auth.bearer_token
-            or cfg.reporting.status.auth.bearer_token
-            or cfg.reporting.progress.auth.bearer_token
-            or cfg.reporting.final.auth.bearer_token
-        ),
-    )
-
-    reporter = Reporter(cfg)
-    asset_manager = AssetManager(cfg)
-    uploader = UploadRunner(cfg)
-    publisher = PublishRunner(cfg)
-
-    heartbeat_stop, heartbeat_thread = start_heartbeat(reporter)
-
-    effective_config_path = Path(cfg.outputs.logs_dir) / "effective-job.json"
-    result_path = Path(cfg.outputs.base_dir) / "job-result.json"
-
-    started_at = utc_now_iso()
-
-    try:
-        reporter.report_status(
-            "started",
-            message="Training pipeline started",
-            stage="bootstrap",
-            progress=0,
-        )
-
-        write_json(effective_config_path, json.loads(cfg.model_dump_json()))
-        logger.info("==> config loaded")
-        logger.info("==> job_name: %s", cfg.job_name)
-        logger.info("==> run_name: %s", run_name)
-        logger.info("==> job_id: %s", cfg.job_id or cfg.job_name)
-        logger.info("==> config source: %s", config_source)
-        logger.info("==> run output dir: %s", run_root)
-
-        reporter.report_status(
-            "running",
-            message="Validating Hugging Face access",
-            stage="hf_login",
-            progress=2,
-        )
-        try_hf_login()
-        publisher.ensure_hf_ready()
-
-        pipeline = cfg.pipeline
-        has_steps = bool(pipeline and pipeline.steps)
-
-        if has_steps:
-            logger.info("==> executing pipeline steps")
-        else:
-            logger.warning("==> pipeline.steps missing, falling back to legacy sequence")
-
-        training_result: Dict[str, Any] = {}
-        evaluation_result: Optional[Dict[str, Any]] = None
-        external_refs: List[Dict[str, Any]] = []
-
-        result: Dict[str, Any] = {
-            "status": "success",
-            "job_id": cfg.job_id or cfg.job_name,
-            "job_name": cfg.job_name,
-            "run_name": run_name,
-            "started_at": started_at,
-            "finished_at": None,
-            "config_source": config_source,
-            "training": {},
-            "evaluation": None,
-            "artifacts": {
-                "run_root": str(run_root),
-                "log_file": str(log_file),
-                "effective_config_path": str(effective_config_path),
-                "result_path": str(result_path),
-            },
-            "uploads": {},
-            "upload_errors": {},
-            "externalRefs": external_refs,
-        }
-
-        def run_step(step_key: str, step_kind: str) -> None:
-            nonlocal training_result, evaluation_result
-
-            if step_kind == "prepare_assets":
-                logger.info("==> preparing assets")
-                reporter.report_status(
-                    "running",
-                    message="Preparing assets",
-                    stage="prepare_assets",
-                    progress=5,
-                )
-                asset_manager.prepare_dataset(cfg)
-                asset_manager.prepare_evaluation_dataset(cfg)
-                cleanup_runtime("prepare-assets")
-
-            elif step_kind == "training":
-                from .pipeline.train_runner import run_training
-
-                logger.info("==> starting training")
-                training_result = run_training(cfg, reporter=reporter)
-                logical_base_model_id = cfg.model.logical_base_model_id
-                if logical_base_model_id and not training_result.get("base_model_id"):
-                    training_result["base_model_id"] = logical_base_model_id
-                result["training"] = training_result
-                cleanup_runtime("training")
-
-            elif step_kind == "evaluation":
-                from .pipeline.eval_runner import run_evaluation
-
-                logger.info("==> starting evaluation")
-                cleanup_runtime("pre-evaluation")
-                evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
-                result["evaluation"] = evaluation_result
-                cleanup_runtime("evaluation")
-
-            elif step_kind == "publish_hf":
-                reporter.report_status(
-                    "running",
-                    message="Publishing to HF",
-                    stage="publish",
-                    progress=90,
-                )
-                hf_model_uploads = publisher.upload_to_huggingface(training_result)
-                if hf_model_uploads:
-                    result["uploads"].update(hf_model_uploads)
-
-                hf_metadata_uploads = publisher.upload_hf_metadata(
-                    log_file=str(log_file),
-                    effective_config_path=str(effective_config_path),
-                    result_path=str(result_path),
-                    training_result=training_result,
-                    eval_result=evaluation_result,
-                )
-                if hf_metadata_uploads:
-                    result["uploads"].update(hf_metadata_uploads)
-
-                cleanup_runtime("publish")
-
-            elif step_kind == "upload_artifacts":
-                reporter.report_status(
-                    "running",
-                    message="Uploading artifacts",
-                    stage="upload",
-                    progress=95,
-                )
-                extra_uploads, extra_upload_errors = uploader.upload_non_summary_artifacts(
-                    log_file=str(log_file),
-                    effective_config_path=str(effective_config_path),
-                    training_result=training_result,
-                    eval_result=evaluation_result,
-                )
-                if extra_uploads:
-                    result["uploads"].update(extra_uploads)
-                if extra_upload_errors:
-                    result["upload_errors"].update(extra_upload_errors)
-
-                cleanup_runtime("upload")
-
-        if has_steps:
-            for step in pipeline.steps:
-                if step.enabled:
-                    run_step(step.key, step.kind)
-                else:
-                    logger.info("==> step %s disabled, skipping", step.key)
-        else:
-            if not pipeline or pipeline.prepare_assets.enabled:
-                run_step("prepare_assets", "prepare_assets")
-
-            if not pipeline or pipeline.training.enabled:
-                run_step("training", "training")
-
-            if (pipeline.evaluation.enabled if pipeline else cfg.evaluation.enabled):
-                run_step("evaluation", "evaluation")
-
-            if (pipeline.publish.enabled if pipeline else cfg.huggingface.enabled):
-                run_step("publish", "publish_hf")
-
-            if (pipeline.upload.enabled if pipeline else cfg.upload.enabled):
-                run_step("upload", "upload_artifacts")
-
-        result["finished_at"] = utc_now_iso()
-        write_json(result_path, result)
-
-        should_upload = pipeline.upload.enabled if pipeline else cfg.upload.enabled
-        if should_upload and cfg.upload.target == "url" and cfg.upload.url_targets.summary_url:
-            try:
-                summary_upload = uploader.upload_summary(str(result_path))
-                if summary_upload:
-                    result["uploads"].update(summary_upload)
-                    write_json(result_path, result)
-            except Exception as exc:
-                logger.exception("summary upload failed")
-                result["upload_errors"]["summary"] = str(exc)
-                write_json(result_path, result)
-
-        if result["upload_errors"]:
-            logger.warning("==> pipeline finished with upload warnings")
-            for key, value in result["upload_errors"].items():
-                logger.warning("==> upload warning [%s]: %s", key, value)
-
-        logger.info("==> pipeline finished successfully")
-        reporter.report_status(
-            "finished",
-            message=(
-                "Training pipeline finished successfully"
-                if not result["upload_errors"]
-                else "Training completed, but some URL artifact uploads failed"
-            ),
-            stage="finished",
-            progress=100,
-        )
-        reporter.report_final(result, status="finished")
-
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        return result
-
-    except Exception as exc:
-        error_msg = str(exc)
-        stack_trace = traceback.format_exc()
-
-        logger.error("FATAL ERROR: %s", error_msg)
-        logger.error(stack_trace)
-
-        logs_tail = tail_file(log_file, 50)
-
-        failed_result = {
-            "status": "failed",
-            "job_id": cfg.job_id or cfg.job_name,
-            "job_name": cfg.job_name,
-            "run_name": run_name,
-            "started_at": started_at,
-            "finished_at": utc_now_iso(),
-            "config_source": config_source,
-            "error": error_msg,
-            "artifacts": {
-                "run_root": str(run_root),
-                "log_file": str(log_file),
-                "effective_config_path": str(effective_config_path),
-                "result_path": str(result_path),
-            },
-        }
-        write_json(result_path, failed_result)
-
-        reporter.report_error(error_msg, logs=logs_tail)
-        reporter.report_final(failed_result, status="failed")
-        return failed_result
-
-    finally:
-        stop_heartbeat(heartbeat_stop, heartbeat_thread)
-        try:
-            reporter.close()
-        except Exception:
-            pass
-        teardown_logging(handlers)
-        cleanup_runtime("job-finalize")
+    pipeline = Pipeline(cfg, config_source, bootstrap_meta)
+    return pipeline.run()
 
 
 def main():

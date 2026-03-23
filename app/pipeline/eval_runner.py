@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from ..adapters.reporter import Reporter
 from ..bootstrap.schemas import JobConfig
+from .utils import cleanup_runtime, check_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -33,28 +34,6 @@ def _build_worker_payload(cfg: JobConfig, training_result: Dict[str, Any]) -> Di
         "evaluation": json.loads(cfg.evaluation.model_dump_json()),
         "training_result": training_result,
     }
-
-
-def _cleanup_runtime(stage: str) -> None:
-    import gc
-    import time
-
-    logger.info("==> cleaning runtime after %s", stage)
-
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except Exception:
-        pass
-
-    time.sleep(0.3)
 
 
 def _is_retryable_vllm_error(stderr: str) -> bool:
@@ -141,13 +120,18 @@ def run_evaluation(
             },
         )
 
-    _cleanup_runtime("pre-evaluation")
+    cleanup_runtime("pre-evaluation")
+    check_gpu_memory(min_free_gb=1.0) # Just a warning if low
 
     attempts = _attempt_overrides(cfg)
     last_error = None
 
-    for idx, override in enumerate(attempts, start=1):
-        _cleanup_runtime(f"pre-evaluation-attempt-{idx}")
+    # Limit attempts by config
+    max_attempts = min(len(attempts), cfg.evaluation.retry_tries)
+
+    for idx in range(1, max_attempts + 1):
+        override = attempts[idx-1]
+        cleanup_runtime(f"pre-evaluation-attempt-{idx}")
 
         eval_cfg = cfg.model_copy(deep=True)
         eval_cfg.evaluation.gpu_memory_utilization = override["gpu_memory_utilization"]
@@ -172,7 +156,7 @@ def run_evaluation(
         logger.info(
             "==> evaluation attempt %s/%s: gpu_memory_utilization=%s max_num_seqs=%s max_num_batched_tokens=%s max_model_len=%s",
             idx,
-            len(attempts),
+            max_attempts,
             override["gpu_memory_utilization"],
             override["max_num_seqs"],
             override["max_num_batched_tokens"],
@@ -185,7 +169,7 @@ def run_evaluation(
                 "running",
                 stage="evaluation",
                 progress=1,
-                message=f"evaluation attempt {idx}/{len(attempts)}",
+                message=f"evaluation attempt {idx}/{max_attempts}",
                 extra=override,
             )
 
@@ -207,7 +191,7 @@ def run_evaluation(
         if process.stderr:
             logger.warning("==> evaluation worker stderr:\n%s", process.stderr.strip())
 
-        _cleanup_runtime(f"post-evaluation-attempt-{idx}")
+        cleanup_runtime(f"post-evaluation-attempt-{idx}")
 
         if process.returncode == 0 and response_path.exists():
             with response_path.open("r", encoding="utf-8") as f:
@@ -234,7 +218,7 @@ def run_evaluation(
                 f"stderr: {process.stderr.strip() or '<empty>'}"
             )
 
-        if idx < len(attempts) and _is_retryable_vllm_error(process.stderr):
+        if idx < max_attempts and _is_retryable_vllm_error(process.stderr):
             logger.warning("==> retryable vLLM failure detected, retrying with smaller memory settings")
             continue
 

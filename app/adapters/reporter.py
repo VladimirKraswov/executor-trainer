@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple
 import requests
 
 from ..bootstrap.schemas import CallbackConfig, JobConfig
+from ..pipeline.utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,8 @@ def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tup
     except Exception:
         value = fallback
 
-    read_timeout = max(1.0, min(value, 5.0))
-    connect_timeout = 2.0
+    read_timeout = max(1.0, min(value, 15.0))
+    connect_timeout = 5.0
     return connect_timeout, read_timeout
 
 
@@ -33,7 +34,7 @@ class Reporter:
 
         self.session = requests.Session()
 
-        self._queue: queue.Queue[Tuple[str, CallbackConfig, Dict[str, Any]]] = queue.Queue(maxsize=1000)
+        self._queue: queue.Queue[Tuple[str, CallbackConfig, Dict[str, Any]]] = queue.Queue(maxsize=2000)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -72,14 +73,24 @@ class Reporter:
         return callbacks
 
     def _deliver(self, event_kind: str, callback: CallbackConfig, payload: Dict[str, Any]) -> None:
-        logger.info("==> reporting %s to %s", event_kind, callback.url)
-        response = self.session.post(
-            callback.url,
-            json=payload,
-            headers=self._build_headers(callback),
-            timeout=_safe_timeout(callback.timeout_sec, 3.0),
+        logger.debug("==> reporting %s to %s", event_kind, callback.url)
+
+        @retry(
+            tries=callback.retry_tries,
+            delay=callback.retry_delay,
+            backoff=callback.retry_backoff,
+            logger=logger
         )
-        response.raise_for_status()
+        def _post():
+            response = self.session.post(
+                callback.url,
+                json=payload,
+                headers=self._build_headers(callback),
+                timeout=_safe_timeout(callback.timeout_sec, 5.0),
+            )
+            response.raise_for_status()
+
+        _post()
 
     def _enqueue(self, event_kind: str, callback: CallbackConfig, payload: Dict[str, Any]) -> None:
         item = (event_kind, callback, copy.deepcopy(payload))

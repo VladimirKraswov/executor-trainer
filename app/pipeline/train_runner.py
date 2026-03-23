@@ -18,6 +18,7 @@ from trl import SFTTrainer
 
 from ..adapters.reporter import Reporter
 from ..bootstrap.schemas import JobConfig
+from .utils import cleanup_runtime, check_disk_space, check_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -64,32 +65,6 @@ def safe_float(value: Any) -> Optional[float]:
     except Exception:
         pass
     return None
-
-
-def _cleanup_runtime(stage: str) -> None:
-    logger.info("==> cleaning runtime after %s", stage)
-
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-    try:
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            try:
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
-    except Exception:
-        pass
 
 
 def build_text_from_messages(messages: list[dict], tokenizer) -> str:
@@ -216,6 +191,10 @@ def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bo
         "optim": cfg.training.optim,
         "push_to_hub": False,
         "logging_dir": cfg.outputs.logs_dir,
+        "max_grad_norm": cfg.training.max_grad_norm,
+        "weight_decay": cfg.training.weight_decay,
+        "lr_scheduler_type": cfg.training.lr_scheduler_type,
+        "seed": cfg.training.seed or cfg.seed,
     }
 
     sig = inspect.signature(TrainingArguments.__init__)
@@ -283,6 +262,8 @@ def _build_sft_trainer(
 
 def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
     ensure_dirs(cfg)
+    check_disk_space(cfg.outputs.base_dir, min_free_gb=10.0)
+    check_gpu_memory(min_free_gb=2.0)
 
     model = None
     tokenizer = None
@@ -319,6 +300,7 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
             local_files_only=(cfg.model.source == "local"),
             trust_remote_code=cfg.model.trust_remote_code,
             device_map="auto",
+            revision=cfg.model.revision,
         )
 
         if tokenizer.pad_token is None:
@@ -414,6 +396,7 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
 
         merged_saved = False
         if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
+            check_disk_space(cfg.outputs.base_dir, min_free_gb=20.0)
             if reporter:
                 reporter.report_status(
                     "running",
@@ -520,4 +503,4 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
         except Exception:
             pass
 
-        _cleanup_runtime("training")
+        cleanup_runtime("training")

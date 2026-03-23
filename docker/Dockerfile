@@ -1,3 +1,4 @@
+# Base image with CUDA and python
 ARG BASE_IMAGE=igortet/model-qwen-7b
 FROM ${BASE_IMAGE}
 
@@ -9,9 +10,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/cache/huggingface \
     TRANSFORMERS_CACHE=/cache/huggingface \
     HUGGINGFACE_HUB_CACHE=/cache/huggingface \
-    HF_HUB_DISABLE_TELEMETRY=1
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    VLLM_PYTHON_BIN=/opt/vllm-venv/bin/python
 
-RUN apt-get update && apt-get install -y \
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
@@ -25,30 +28,31 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /trainer
 
-COPY requirements.txt /trainer/requirements.txt
-COPY requirements.vllm.txt /trainer/requirements.vllm.txt
+# Copy requirement files first for better caching
+COPY requirements.txt requirements.vllm.txt /trainer/
+
+# Copy local wheels if any (empty if none)
 COPY packages /trainer/packages
 COPY docker/install_with_local_wheels.sh /trainer/install_with_local_wheels.sh
+RUN chmod +x /trainer/install_with_local_wheels.sh
 
-RUN chmod +x /trainer/install_with_local_wheels.sh && \
-    mkdir -p /trainer/packages/pip && \
-    echo "==> copied local wheels:" && \
-    find /trainer/packages/pip -maxdepth 1 -type f -name '*.whl' | sort | head -200
+# Setup training virtual environment
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install -U pip setuptools wheel && \
+    /trainer/install_with_local_wheels.sh /opt/venv/bin/python --requirements /trainer/requirements.txt /trainer/packages/pip
 
-# train env
-RUN python3 -m venv /opt/venv
-RUN /opt/venv/bin/pip install -U pip setuptools wheel
-RUN /trainer/install_with_local_wheels.sh /opt/venv/bin/python --requirements /trainer/requirements.txt /trainer/packages/pip
+# Setup separate vLLM virtual environment
+RUN python3 -m venv /opt/vllm-venv && \
+    /opt/vllm-venv/bin/pip install -U pip setuptools wheel && \
+    /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --requirements /trainer/requirements.vllm.txt /trainer/packages/pip
 
-# separate vLLM env
-RUN python3 -m venv /opt/vllm-venv
-RUN /opt/vllm-venv/bin/pip install -U pip setuptools wheel
-RUN /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --requirements /trainer/requirements.vllm.txt /trainer/packages/pip
-
+# Copy application code
 COPY app /trainer/app
 COPY docker/entrypoint.sh /trainer/entrypoint.sh
+RUN chmod +x /trainer/entrypoint.sh
 
-RUN chmod +x /trainer/entrypoint.sh && \
-    mkdir -p /output /cache/huggingface
+# Final setup
+RUN mkdir -p /output /cache/huggingface && \
+    chmod -R 777 /output /cache/huggingface
 
 ENTRYPOINT ["/trainer/entrypoint.sh"]

@@ -1,18 +1,21 @@
-# ignore everything by default
-*
+# Whitelist approach for .dockerignore
+# 1. Ignore everything
+**
 
-# keep source needed for build
-!app/**
-!docker/**
+# 2. Allow only necessary files and folders
 !requirements.txt
 !requirements.vllm.txt
-!README.md
-!examples/**
-!.env.local.example
-!.env.remote.example
-
-# keep local wheels
 !packages/
-!packages/README.md
-!packages/pip/
-!packages/pip/**
+!app/
+!docker/
+!docker/entrypoint.sh
+!docker/install_with_local_wheels.sh
+
+# 3. Explicitly ignore sensitive/temporary files within allowed folders
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.log
+**/*.tmp
+app/tests/

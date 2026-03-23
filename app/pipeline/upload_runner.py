@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, Tuple
 
 from .archiver import Archiver
 from ..bootstrap.schemas import JobConfig
+from .utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -26,23 +27,26 @@ class UploadRunner:
         if not upload_url or not path.exists():
             return {}
 
-        with path.open("rb") as f:
-            files = {"file": (path.name, f, "application/octet-stream")}
-            data = {
-                "job_id": self.cfg.job_id or self.cfg.job_name,
-                "job_name": self.cfg.job_name,
-                "artifact_type": artifact_type,
-            }
-            response = self.session.post(
-                upload_url,
-                files=files,
-                data=data,
-                headers=self._headers(),
-                timeout=(10, self.cfg.upload.timeout_sec),
-            )
-            response.raise_for_status()
+        @retry(tries=self.cfg.upload.retry_tries, delay=5, backoff=2, logger=logger)
+        def _do_upload():
+            with path.open("rb") as f:
+                files = {"file": (path.name, f, "application/octet-stream")}
+                data = {
+                    "job_id": self.cfg.job_id or self.cfg.job_name,
+                    "job_name": self.cfg.job_name,
+                    "artifact_type": artifact_type,
+                }
+                response = self.session.post(
+                    upload_url,
+                    files=files,
+                    data=data,
+                    headers=self._headers(),
+                    timeout=(10, self.cfg.upload.timeout_sec),
+                )
+                response.raise_for_status()
+            return {"url": upload_url, "path": str(path)}
 
-        return {"url": upload_url, "path": str(path)}
+        return _do_upload()
 
     def _archive_and_upload_dir(
         self,
@@ -61,18 +65,23 @@ class UploadRunner:
             str(archive_path),
             exclude_names={"downloads", "__pycache__"},
         )
-        self.archiver.upload_archive(
-            str(archive_path),
-            upload_url,
-            headers=self._headers(),
-            form_data={
-                "job_id": self.cfg.job_id or self.cfg.job_name,
-                "job_name": self.cfg.job_name,
-                "artifact_type": artifact_type,
-            },
-            timeout_sec=self.cfg.upload.timeout_sec,
-        )
-        return {"url": upload_url, "archive_path": str(archive_path)}
+
+        @retry(tries=self.cfg.upload.retry_tries, delay=10, backoff=2, logger=logger)
+        def _do_upload():
+            self.archiver.upload_archive(
+                str(archive_path),
+                upload_url,
+                headers=self._headers(),
+                form_data={
+                    "job_id": self.cfg.job_id or self.cfg.job_name,
+                    "job_name": self.cfg.job_name,
+                    "artifact_type": artifact_type,
+                },
+                timeout_sec=self.cfg.upload.timeout_sec,
+            )
+            return {"url": upload_url, "archive_path": str(archive_path)}
+
+        return _do_upload()
 
     def _safe_upload(
         self,

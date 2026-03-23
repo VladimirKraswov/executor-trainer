@@ -94,6 +94,8 @@ class DatasetConfig(AppBaseModel):
     input_field: str = "input"
     output_field: str = "output"
     messages_field: str = "messages"
+    max_samples: Optional[int] = None
+    validation_split: float = 0.0
 
     @model_validator(mode="after")
     def validate_dataset(self) -> "DatasetConfig":
@@ -120,6 +122,10 @@ class TrainingConfig(AppBaseModel):
     save_total_limit: int = 2
     optim: str = "adamw_8bit"
     output_dir: Optional[str] = None
+    max_grad_norm: float = 0.3
+    weight_decay: float = 0.01
+    lr_scheduler_type: str = "linear"
+    seed: int = 3407
 
 
 class LoraConfig(AppBaseModel):
@@ -183,6 +189,9 @@ class CallbackConfig(AppBaseModel):
     url: Optional[str] = None
     timeout_sec: int = 15
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    retry_tries: int = 3
+    retry_delay: float = 2.0
+    retry_backoff: float = 2.0
 
     @property
     def active(self) -> bool:
@@ -194,6 +203,7 @@ class ReportingConfig(AppBaseModel):
     progress: CallbackConfig = Field(default_factory=CallbackConfig)
     final: CallbackConfig = Field(default_factory=CallbackConfig)
     logs: CallbackConfig = Field(default_factory=CallbackConfig)
+    heartbeat_interval: int = 30
 
 
 class EvaluationDatasetConfig(AppBaseModel):
@@ -258,6 +268,9 @@ class EvaluationConfig(AppBaseModel):
     max_model_len: Optional[int] = 1024
     enforce_eager: bool = False
 
+    # Retry policy for eval worker
+    retry_tries: int = 3
+
     @model_validator(mode="after")
     def validate_enabled(self) -> "EvaluationConfig":
         if self.enabled and self.dataset is None:
@@ -291,6 +304,7 @@ class UploadConfig(AppBaseModel):
     repo_id_metadata: Optional[str] = None
     private: bool = True
     commit_message: str = "trainer-service upload"
+    retry_tries: int = 3
 
 
 class HuggingFacePublishConfig(AppBaseModel):
@@ -303,6 +317,7 @@ class HuggingFacePublishConfig(AppBaseModel):
     private: bool = True
     commit_message: str = "trainer-service upload"
     revision: Optional[str] = None
+    retry_tries: int = 3
 
 
 class PipelineStage(AppBaseModel):
@@ -352,6 +367,9 @@ class JobConfig(AppBaseModel):
     job_id: Optional[str] = None
     job_name: str
     mode: Literal["local", "remote", "auto"] = "auto"
+    seed: int = 3407
+    tags: List[str] = Field(default_factory=list)
+    executor_identity: Optional[str] = None
 
     model: ModelConfig
     dataset: DatasetConfig

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from urllib.parse import urlparse
+import logging
 
 import requests
 
 from ..bootstrap.schemas import JobConfig
+from .utils import retry
 
+logger = logging.getLogger(__name__)
 
 class AssetManager:
     def __init__(self, cfg: JobConfig):
@@ -18,8 +21,9 @@ class AssetManager:
         suffix = Path(parsed.path).suffix
         return suffix or default_suffix
 
+    @retry(tries=3, delay=5, backoff=2, logger=logger)
     def download_file(self, url: str, dest_path: Path) -> Path:
-        print(f"==> downloading {url} to {dest_path}")
+        logger.info("==> downloading %s to %s", url, dest_path)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         with requests.get(url, stream=True, timeout=120) as response:
@@ -50,7 +54,7 @@ class AssetManager:
             self.download_file(cfg.dataset.val_url, val_path)
             cfg.dataset.val_path = str(val_path)
 
-        print("==> dataset prepared")
+        logger.info("==> dataset prepared")
 
     def prepare_evaluation_dataset(self, cfg: JobConfig) -> None:
         if not cfg.evaluation.enabled or not cfg.evaluation.dataset:
@@ -72,4 +76,4 @@ class AssetManager:
         self.download_file(eval_cfg.url, eval_path)
         eval_cfg.path = str(eval_path)
 
-        print("==> evaluation dataset prepared")
+        logger.info("==> evaluation dataset prepared")

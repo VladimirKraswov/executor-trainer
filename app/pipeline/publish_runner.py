@@ -7,6 +7,7 @@ from huggingface_hub import HfApi
 
 from ..adapters.hf_utils import build_hf_api, get_hf_token
 from ..bootstrap.schemas import JobConfig
+from .utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,8 @@ class PublishRunner:
         repo_dir = Path(folder_path)
         readme_path = repo_dir / "README.md"
         if not readme_path.exists():
-            return
+            # Create a simple README.md if it doesn't exist
+            readme_path.write_text(f"# {self.cfg.job_name}\n\nFine-tuned model.", encoding="utf-8")
 
         base_model_id = self._resolve_hf_base_model_id(training_result)
         changed = self._rewrite_readme_frontmatter_base_model(readme_path, base_model_id)
@@ -200,6 +202,11 @@ class PublishRunner:
             else self.cfg.upload.commit_message
         )
         revision = self.cfg.huggingface.revision
+        retry_tries = (
+            self.cfg.huggingface.retry_tries
+            if self.cfg.huggingface.enabled
+            else self.cfg.upload.retry_tries
+        )
 
         return {
             "request_lora": request_lora,
@@ -211,6 +218,7 @@ class PublishRunner:
             "private": private,
             "commit_message": commit_message,
             "revision": revision,
+            "retry_tries": retry_tries,
         }
 
     def ensure_hf_ready(self) -> Dict[str, Any]:
@@ -252,21 +260,25 @@ class PublishRunner:
 
             self._normalize_model_card_metadata(lora_dir, training_result)
 
-            api.create_repo(
-                repo_id=plan["lora_repo"],
-                repo_type="model",
-                private=plan["private"],
-                exist_ok=True,
-            )
-            api.upload_folder(
-                repo_id=plan["lora_repo"],
-                repo_type="model",
-                folder_path=lora_dir,
-                commit_message=plan["commit_message"],
-                revision=plan["revision"],
-                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
-            )
-            uploaded["hf_lora"] = {"repo_id": plan["lora_repo"], "path": lora_dir}
+            @retry(tries=plan["retry_tries"], delay=10, backoff=2, logger=logger)
+            def _do_lora_upload():
+                api.create_repo(
+                    repo_id=plan["lora_repo"],
+                    repo_type="model",
+                    private=plan["private"],
+                    exist_ok=True,
+                )
+                api.upload_folder(
+                    repo_id=plan["lora_repo"],
+                    repo_type="model",
+                    folder_path=lora_dir,
+                    commit_message=plan["commit_message"],
+                    revision=plan["revision"],
+                    ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+                )
+                return {"repo_id": plan["lora_repo"], "path": lora_dir}
+
+            uploaded["hf_lora"] = _do_lora_upload()
 
         if plan["request_merged"]:
             merged_dir = training_result.get("merged_dir")
@@ -275,21 +287,25 @@ class PublishRunner:
 
             self._normalize_model_card_metadata(merged_dir, training_result)
 
-            api.create_repo(
-                repo_id=plan["merged_repo"],
-                repo_type="model",
-                private=plan["private"],
-                exist_ok=True,
-            )
-            api.upload_folder(
-                repo_id=plan["merged_repo"],
-                repo_type="model",
-                folder_path=merged_dir,
-                commit_message=plan["commit_message"],
-                revision=plan["revision"],
-                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
-            )
-            uploaded["hf_merged"] = {"repo_id": plan["merged_repo"], "path": merged_dir}
+            @retry(tries=plan["retry_tries"], delay=20, backoff=2, logger=logger)
+            def _do_merged_upload():
+                api.create_repo(
+                    repo_id=plan["merged_repo"],
+                    repo_type="model",
+                    private=plan["private"],
+                    exist_ok=True,
+                )
+                api.upload_folder(
+                    repo_id=plan["merged_repo"],
+                    repo_type="model",
+                    folder_path=merged_dir,
+                    commit_message=plan["commit_message"],
+                    revision=plan["revision"],
+                    ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+                )
+                return {"repo_id": plan["merged_repo"], "path": merged_dir}
+
+            uploaded["hf_merged"] = _do_merged_upload()
 
         return uploaded
 
@@ -301,20 +317,25 @@ class PublishRunner:
         path_in_repo: str,
         commit_message: str,
         revision: Optional[str] = None,
+        retry_tries: int = 3,
     ) -> Optional[str]:
         path = Path(file_path)
         if not path.exists():
             return None
 
-        api.upload_file(
-            path_or_fileobj=str(path),
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type="model",
-            commit_message=commit_message,
-            revision=revision,
-        )
-        return path_in_repo
+        @retry(tries=retry_tries, delay=5, backoff=2, logger=logger)
+        def _do_upload():
+            api.upload_file(
+                path_or_fileobj=str(path),
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=commit_message,
+                revision=revision,
+            )
+            return path_in_repo
+
+        return _do_upload()
 
     def upload_hf_metadata(
         self,
@@ -344,6 +365,7 @@ class PublishRunner:
 
         commit_message = f"{plan['commit_message']} (metadata)"
         revision = plan["revision"]
+        retry_tries = plan["retry_tries"]
 
         uploaded_files: list[str] = []
 
@@ -392,6 +414,7 @@ class PublishRunner:
                 path_in_repo=path_in_repo,
                 commit_message=commit_message,
                 revision=revision,
+                retry_tries=retry_tries,
             )
             if uploaded_path:
                 uploaded_files.append(uploaded_path)
