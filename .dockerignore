@@ -1,0 +1,18 @@
+# ignore everything by default
+*
+
+# keep source needed for build
+!app/**
+!docker/**
+!requirements.txt
+!requirements.vllm.txt
+!README.md
+!examples/**
+!.env.local.example
+!.env.remote.example
+
+# keep local wheels
+!packages/
+!packages/README.md
+!packages/pip/
+!packages/pip/**
