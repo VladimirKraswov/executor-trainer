@@ -57,6 +57,22 @@ def resolve_model_args(cfg: JobConfig) -> tuple[str, bool, Optional[str]]:
     return model_name, load_in_4bit, logical_base_model_id
 
 
+def resolve_runtime_dtype(cfg: JobConfig) -> Optional[torch.dtype]:
+    value = str(cfg.model.dtype or "auto").lower().strip()
+
+    if value == "bfloat16":
+        return torch.bfloat16
+    if value == "float16":
+        return torch.float16
+    if value == "float32":
+        return torch.float32
+
+    if cfg.training.bf16:
+        return torch.bfloat16
+
+    return None
+
+
 def safe_float(value: Any) -> Optional[float]:
     try:
         parsed = float(value)
@@ -271,6 +287,7 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
     trainer = None
 
     model_name, load_in_4bit, logical_base_model_id = resolve_model_args(cfg)
+    runtime_dtype = resolve_runtime_dtype(cfg)
 
     logger.info("==> loading model: %s", model_name)
     if logical_base_model_id:
@@ -288,14 +305,15 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
                     "model_name": model_name,
                     "logical_base_model_id": logical_base_model_id,
                     "load_in_4bit": load_in_4bit,
-                    "dtype": cfg.model.dtype,
+                    "requested_dtype": cfg.model.dtype,
+                    "runtime_dtype": str(runtime_dtype) if runtime_dtype is not None else "auto",
                 },
             )
 
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
-            dtype=torch.bfloat16 if cfg.training.bf16 else None,
+            dtype=runtime_dtype,
             load_in_4bit=load_in_4bit,
             local_files_only=(cfg.model.source == "local"),
             trust_remote_code=cfg.model.trust_remote_code,
@@ -435,6 +453,8 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
             "base_model_name_or_path": logical_base_model_id,
             "load_in_4bit": load_in_4bit,
             "bf16": cfg.training.bf16,
+            "requested_dtype": cfg.model.dtype,
+            "runtime_dtype": str(runtime_dtype) if runtime_dtype is not None else "auto",
             "merged_saved": merged_saved,
             "train_runtime": metrics.get("train_runtime"),
             "train_samples_per_second": metrics.get("train_samples_per_second"),

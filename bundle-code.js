@@ -12,7 +12,7 @@ const  fsp = require("fs/promises");
 const  path = require("path")
 
 const PROJECT_ROOT = process.cwd();
-const IGNORE_FILE_NAME = ".codebun)dleignore";
+const IGNORE_FILE_NAME = ".codebundleignore";
 const OUTPUT_FILE = path.join(PROJECT_ROOT, "codebundle.txt");
 
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB

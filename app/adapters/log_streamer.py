@@ -13,13 +13,14 @@ from ..pipeline.utils import retry
 
 logger = logging.getLogger(__name__)
 
+
 def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tuple[float, float]:
     try:
         value = float(timeout_sec or fallback)
     except Exception:
         value = fallback
 
-    read_timeout = max(1.0, min(value, 30.0)) # Increased max read timeout
+    read_timeout = max(1.0, min(value, 30.0))
     connect_timeout = 5.0
     return connect_timeout, read_timeout
 
@@ -59,7 +60,7 @@ class LogStreamer(logging.Handler):
         self._worker.start()
 
     def _deliver(self, payload: dict) -> None:
-        @retry(tries=5, delay=1, backoff=2) # More retries for log streaming
+        @retry(tries=5, delay=1, backoff=2)
         def _post():
             response = self.session.post(
                 self.logs_url,
@@ -73,7 +74,6 @@ class LogStreamer(logging.Handler):
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set() or not self._queue.empty():
-            # Batch logs if possible? For now, keep it simple but more resilient
             try:
                 payload = self._queue.get(timeout=0.2)
             except queue.Empty:
@@ -92,7 +92,6 @@ class LogStreamer(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            # Add context to log message if possible
             record.job_id = self.job_id
             record.job_name = self.job_name
 
@@ -103,21 +102,19 @@ class LogStreamer(logging.Handler):
             chunk = f"{message}\n"
             encoded = chunk.encode("utf-8", errors="replace")
 
-            with self.offset_lock:
-                current_offset = self.offset
-                self.offset += len(encoded)
-
-            payload = {
-                "job_id": self.job_id,
-                "job_name": self.job_name,
-                "offset": current_offset,
-                "chunk": chunk,
-                "timestamp": record.created,
-                "level": record.levelname,
-            }
-
             try:
-                self._queue.put_nowait(payload)
+                with self.offset_lock:
+                    current_offset = self.offset
+                    payload = {
+                        "job_id": self.job_id,
+                        "job_name": self.job_name,
+                        "offset": current_offset,
+                        "chunk": chunk,
+                        "timestamp": record.created,
+                        "level": record.levelname,
+                    }
+                    self._queue.put_nowait(payload)
+                    self.offset += len(encoded)
             except queue.Full:
                 try:
                     sys.stderr.write("[log-streamer] queue is full, dropping log chunk\n")

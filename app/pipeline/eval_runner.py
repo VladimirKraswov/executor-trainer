@@ -51,7 +51,45 @@ def _is_retryable_vllm_error(stderr: str) -> bool:
 def _attempt_overrides(cfg: JobConfig) -> list[dict]:
     base_max_len = cfg.evaluation.max_model_len or 1024
 
-    return [
+    attempts: list[dict] = []
+    seen: set[tuple] = set()
+
+    def add_attempt(
+        gpu_memory_utilization,
+        max_num_seqs,
+        max_num_batched_tokens,
+        max_model_len,
+        batch_size,
+    ) -> None:
+        key = (
+            gpu_memory_utilization,
+            max_num_seqs,
+            max_num_batched_tokens,
+            max_model_len,
+            batch_size,
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        attempts.append(
+            {
+                "gpu_memory_utilization": gpu_memory_utilization,
+                "max_num_seqs": max_num_seqs,
+                "max_num_batched_tokens": max_num_batched_tokens,
+                "max_model_len": max_model_len,
+                "batch_size": batch_size,
+            }
+        )
+
+    add_attempt(
+        float(cfg.evaluation.gpu_memory_utilization),
+        cfg.evaluation.max_num_seqs,
+        cfg.evaluation.max_num_batched_tokens,
+        cfg.evaluation.max_model_len,
+        cfg.evaluation.batch_size,
+    )
+
+    fallback_attempts = [
         {
             "gpu_memory_utilization": 0.72,
             "max_num_seqs": 2,
@@ -89,6 +127,17 @@ def _attempt_overrides(cfg: JobConfig) -> list[dict]:
         },
     ]
 
+    for item in fallback_attempts:
+        add_attempt(
+            item["gpu_memory_utilization"],
+            item["max_num_seqs"],
+            item["max_num_batched_tokens"],
+            item["max_model_len"],
+            item["batch_size"],
+        )
+
+    return attempts
+
 
 def run_evaluation(
     cfg: JobConfig,
@@ -121,16 +170,15 @@ def run_evaluation(
         )
 
     cleanup_runtime("pre-evaluation")
-    check_gpu_memory(min_free_gb=1.0) # Just a warning if low
+    check_gpu_memory(min_free_gb=1.0)
 
     attempts = _attempt_overrides(cfg)
     last_error = None
 
-    # Limit attempts by config
-    max_attempts = min(len(attempts), cfg.evaluation.retry_tries)
+    max_attempts = min(len(attempts), max(1, int(cfg.evaluation.retry_tries or 1)))
 
     for idx in range(1, max_attempts + 1):
-        override = attempts[idx-1]
+        override = attempts[idx - 1]
         cleanup_runtime(f"pre-evaluation-attempt-{idx}")
 
         eval_cfg = cfg.model_copy(deep=True)
@@ -154,13 +202,14 @@ def run_evaluation(
         ]
 
         logger.info(
-            "==> evaluation attempt %s/%s: gpu_memory_utilization=%s max_num_seqs=%s max_num_batched_tokens=%s max_model_len=%s",
+            "==> evaluation attempt %s/%s: gpu_memory_utilization=%s max_num_seqs=%s max_num_batched_tokens=%s max_model_len=%s batch_size=%s",
             idx,
             max_attempts,
             override["gpu_memory_utilization"],
             override["max_num_seqs"],
             override["max_num_batched_tokens"],
             override["max_model_len"],
+            override["batch_size"],
         )
         logger.info("==> starting evaluation worker: %s", " ".join(cmd))
 

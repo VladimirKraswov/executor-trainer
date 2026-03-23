@@ -1,29 +1,33 @@
 === CODE BUNDLE ===
-root: /Volumes/Extend/work/forge-ml-execution-fabric/apps/executor-trainer
-ignore: .codebun)dleignore
-generated: 2026-03-23T10:43:28.804Z
+root: /Volumes/Extend/work/executor-trainer
+ignore: .codebundleignore
+generated: 2026-03-23T14:31:56.482Z
 
 
 
 path: /.dockerignore
 ----------------------------------------
-# ignore everything by default
-*
+# Whitelist approach for .dockerignore
+# 1. Ignore everything
+**
 
-# keep source needed for build
-!app/**
-!docker/**
+# 2. Allow only necessary files and folders
 !requirements.txt
-!README.md
-!examples/**
-!.env.local.example
-!.env.remote.example
-
-# keep local wheels
+!requirements.vllm.txt
 !packages/
-!packages/README.md
-!packages/pip/
-!packages/pip/**
+!app/
+!docker/
+!docker/entrypoint.sh
+!docker/install_with_local_wheels.sh
+
+# 3. Explicitly ignore sensitive/temporary files within allowed folders
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.log
+**/*.tmp
+app/tests/
 
 
 path: /.env.local.example
@@ -38,6 +42,43 @@ path: /.env.remote.example
 CONFIG_SOURCE=remote
 CONFIG_REF=http://192.168.31.32:8010/files/job.remote.json
 HF_TOKEN=hf_xxx
+
+
+path: /.vscode/c_cpp_properties.json
+----------------------------------------
+{
+  "configurations": [
+    {
+      "name": "STM32",
+      "includePath": [
+        "${workspaceFolder}/Core/Inc",
+        "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc",
+        "${workspaceFolder}/Drivers/CMSIS/Include",
+        "${workspaceFolder}/Drivers/CMSIS/Device/ST/STM32F4xx/Include",
+        "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc/Legacy"
+      ],
+      "defines": [
+        "USE_HAL_DRIVER",
+        "STM32F407xx"
+      ],
+      "compilerPath": "/Applications/STM32CubeIDE.app/Contents/Eclipse/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.macos64_1.0.100.202509120712/tools/bin/arm-none-eabi-gcc",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "gcc-arm",
+      "browse": {
+        "path": [
+          "${workspaceFolder}/Core/Inc",
+          "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc",
+          "${workspaceFolder}/Drivers/CMSIS/Include",
+          "${workspaceFolder}/Drivers/CMSIS/Device/ST/STM32F4xx/Include",
+          "${workspaceFolder}/Drivers/STM32F4xx_HAL_Driver/Inc/Legacy"
+        ],
+        "limitSymbolsToIncludedHeaders": true
+      }
+    }
+  ],
+  "version": 4
+}
 
 
 path: /app/__init__.py
@@ -105,6 +146,9 @@ from typing import Dict, Optional, Tuple
 
 import requests
 
+from ..pipeline.utils import retry
+
+logger = logging.getLogger(__name__)
 
 def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tuple[float, float]:
     try:
@@ -112,8 +156,8 @@ def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tup
     except Exception:
         value = fallback
 
-    read_timeout = max(1.0, min(value, 5.0))
-    connect_timeout = 2.0
+    read_timeout = max(1.0, min(value, 30.0)) # Increased max read timeout
+    connect_timeout = 5.0
     return connect_timeout, read_timeout
 
 
@@ -125,6 +169,7 @@ class LogStreamer(logging.Handler):
         job_name: str,
         bearer_token: Optional[str] = None,
         timeout_sec: int = 5,
+        max_queue_size: int = 5000,
     ):
         super().__init__()
         self.logs_url = str(logs_url or "").strip()
@@ -141,7 +186,7 @@ class LogStreamer(logging.Handler):
         if bearer_token:
             self.headers["Authorization"] = f"Bearer {bearer_token}"
 
-        self._queue: queue.Queue[dict] = queue.Queue(maxsize=2000)
+        self._queue: queue.Queue[dict] = queue.Queue(maxsize=max_queue_size)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -151,16 +196,21 @@ class LogStreamer(logging.Handler):
         self._worker.start()
 
     def _deliver(self, payload: dict) -> None:
-        response = self.session.post(
-            self.logs_url,
-            json=payload,
-            headers=self.headers,
-            timeout=_safe_timeout(self.timeout_sec, 3.0),
-        )
-        response.raise_for_status()
+        @retry(tries=5, delay=1, backoff=2) # More retries for log streaming
+        def _post():
+            response = self.session.post(
+                self.logs_url,
+                json=payload,
+                headers=self.headers,
+                timeout=_safe_timeout(self.timeout_sec, 5.0),
+            )
+            response.raise_for_status()
+
+        _post()
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set() or not self._queue.empty():
+            # Batch logs if possible? For now, keep it simple but more resilient
             try:
                 payload = self._queue.get(timeout=0.2)
             except queue.Empty:
@@ -170,7 +220,7 @@ class LogStreamer(logging.Handler):
                 self._deliver(payload)
             except Exception as exc:
                 try:
-                    sys.stderr.write(f"[log-streamer] failed to send log chunk: {exc}\n")
+                    sys.stderr.write(f"[log-streamer] FATAL: failed to send log chunk after retries: {exc}\n")
                     sys.stderr.flush()
                 except Exception:
                     pass
@@ -179,6 +229,10 @@ class LogStreamer(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Add context to log message if possible
+            record.job_id = self.job_id
+            record.job_name = self.job_name
+
             message = self.format(record)
             if not message:
                 return
@@ -195,6 +249,8 @@ class LogStreamer(logging.Handler):
                 "job_name": self.job_name,
                 "offset": current_offset,
                 "chunk": chunk,
+                "timestamp": record.created,
+                "level": record.levelname,
             }
 
             try:
@@ -221,9 +277,9 @@ class LogStreamer(logging.Handler):
 
     def close(self) -> None:
         try:
-            self.flush(timeout_sec=2.0)
+            self.flush(timeout_sec=5.0)
             self._stop_event.set()
-            self._worker.join(timeout=2.0)
+            self._worker.join(timeout=5.0)
         finally:
             try:
                 self.session.close()
@@ -246,6 +302,7 @@ from typing import Any, Dict, List, Tuple
 import requests
 
 from ..bootstrap.schemas import CallbackConfig, JobConfig
+from ..pipeline.utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -256,8 +313,8 @@ def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tup
     except Exception:
         value = fallback
 
-    read_timeout = max(1.0, min(value, 5.0))
-    connect_timeout = 2.0
+    read_timeout = max(1.0, min(value, 15.0))
+    connect_timeout = 5.0
     return connect_timeout, read_timeout
 
 
@@ -269,7 +326,7 @@ class Reporter:
 
         self.session = requests.Session()
 
-        self._queue: queue.Queue[Tuple[str, CallbackConfig, Dict[str, Any]]] = queue.Queue(maxsize=1000)
+        self._queue: queue.Queue[Tuple[str, CallbackConfig, Dict[str, Any]]] = queue.Queue(maxsize=2000)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -308,14 +365,24 @@ class Reporter:
         return callbacks
 
     def _deliver(self, event_kind: str, callback: CallbackConfig, payload: Dict[str, Any]) -> None:
-        logger.info("==> reporting %s to %s", event_kind, callback.url)
-        response = self.session.post(
-            callback.url,
-            json=payload,
-            headers=self._build_headers(callback),
-            timeout=_safe_timeout(callback.timeout_sec, 3.0),
+        logger.debug("==> reporting %s to %s", event_kind, callback.url)
+
+        @retry(
+            tries=callback.retry_tries,
+            delay=callback.retry_delay,
+            backoff=callback.retry_backoff,
+            logger=logger
         )
-        response.raise_for_status()
+        def _post():
+            response = self.session.post(
+                callback.url,
+                json=payload,
+                headers=self._build_headers(callback),
+                timeout=_safe_timeout(callback.timeout_sec, 5.0),
+            )
+            response.raise_for_status()
+
+        _post()
 
     def _enqueue(self, event_kind: str, callback: CallbackConfig, payload: Dict[str, Any]) -> None:
         item = (event_kind, callback, copy.deepcopy(payload))
@@ -465,101 +532,50 @@ path: /app/bootstrap/bootstrap_loader.py
 ----------------------------------------
 from __future__ import annotations
 
-import copy
-from typing import Any, Dict, Tuple
+import logging
+from typing import Any, Dict, Optional, Tuple
 
-from ..pipeline.archiver import build_retry_session
-from ..bootstrap.schemas import JobConfig
+import requests
 
+from .schemas import JobConfig
+from ..pipeline.utils import retry
 
-def _resolve_callback_url(payload: Dict[str, Any], key: str) -> str | None:
-    explicit = payload.get(f"{key}_url")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-
-    reporting = payload.get("reporting") or {}
-    value = reporting.get(key)
-
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-
-    if isinstance(value, dict):
-        url = value.get("url")
-        if isinstance(url, str) and url.strip():
-            return url.strip()
-
-    return None
+logger = logging.getLogger(__name__)
 
 
-def load_remote_job_config(
-    job_config_url: str,
-    timeout_sec: int = 30,
-) -> Tuple[JobConfig, Dict[str, Any]]:
-    resolved_url = str(job_config_url or "").strip()
-    if not resolved_url:
-        raise ValueError("JOB_CONFIG_URL is empty")
-
-    session = build_retry_session(total_retries=3)
-
-    print(f"==> loading remote job config from {resolved_url}")
-    response = session.get(resolved_url, timeout=(10, timeout_sec))
+@retry(tries=3, delay=2, backoff=2, logger=logger)
+def load_remote_job_config(url: str) -> Tuple[JobConfig, Dict[str, Any]]:
+    logger.info("==> loading remote config from %s", url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
+
     payload = response.json()
-
     if not isinstance(payload, dict):
-        raise ValueError("Remote job config response must be a JSON object")
+        raise ValueError("Remote config must be a JSON object")
 
-    callback_auth_token = payload.get("callback_auth_token")
+    # Some backends wrap the config in a 'config' or 'job' field
+    config_data = payload.get("config") or payload.get("job") or payload
+    meta = payload.get("meta") or {}
 
-    if "config" in payload:
-        raw_config = copy.deepcopy(payload.get("config") or {})
-        if not raw_config.get("job_id") and payload.get("job_id"):
-            raw_config["job_id"] = payload["job_id"]
-        if not raw_config.get("job_name") and payload.get("job_name"):
-            raw_config["job_name"] = payload["job_name"]
-    else:
-        raw_config = copy.deepcopy(payload)
-
-    if not isinstance(raw_config, dict):
-        raise ValueError("Remote config payload is invalid")
-
-    raw_config["mode"] = "remote"
-
-    reporting = raw_config.setdefault("reporting", {})
-    for key in ("status", "progress", "final", "logs"):
-        callback_cfg = copy.deepcopy(reporting.get(key) or {})
-        explicit_url = _resolve_callback_url(payload, key)
-
-        if explicit_url:
-            callback_cfg["enabled"] = True
-            callback_cfg["url"] = explicit_url
-
-        auth_cfg = copy.deepcopy(callback_cfg.get("auth") or {})
-        if callback_auth_token and not auth_cfg.get("bearer_token"):
-            auth_cfg["bearer_token"] = callback_auth_token
-
-        callback_cfg["auth"] = auth_cfg
-
-        if callback_cfg.get("url"):
-            callback_cfg["enabled"] = bool(callback_cfg.get("enabled", True))
-
-        reporting[key] = callback_cfg
-
-    raw_config["reporting"] = reporting
-
-    cfg = JobConfig.model_validate(raw_config)
-
-    logs_url = (
-        _resolve_callback_url(payload, "logs")
-        or _resolve_callback_url(raw_config, "logs")
-    )
-
-    meta = {
-        "job_config_url": resolved_url,
-        "logs_url": logs_url,
-        "callback_auth_token": callback_auth_token,
+    # Extract callback/logging info from meta or top-level payload if present
+    # This logic allows backend to override/provide endpoints dynamically
+    resolved_meta = {
+        "logs_url": meta.get("logs_url") or payload.get("logs_url"),
+        "status_url": meta.get("status_url") or payload.get("status_url"),
+        "progress_url": meta.get("progress_url") or payload.get("progress_url"),
+        "final_url": meta.get("final_url") or payload.get("final_url"),
+        "callback_auth_token": (
+            meta.get("callback_auth_token")
+            or payload.get("callback_auth_token")
+            or meta.get("bearer_token")
+            or payload.get("bearer_token")
+        ),
     }
-    return cfg, meta
+
+    # Merge resolved_meta into meta
+    meta.update({k: v for k, v in resolved_meta.items() if v})
+
+    return JobConfig.model_validate(config_data), meta
 
 
 path: /app/bootstrap/config_loader.py
@@ -795,6 +811,8 @@ class DatasetConfig(AppBaseModel):
     input_field: str = "input"
     output_field: str = "output"
     messages_field: str = "messages"
+    max_samples: Optional[int] = None
+    validation_split: float = 0.0
 
     @model_validator(mode="after")
     def validate_dataset(self) -> "DatasetConfig":
@@ -821,6 +839,10 @@ class TrainingConfig(AppBaseModel):
     save_total_limit: int = 2
     optim: str = "adamw_8bit"
     output_dir: Optional[str] = None
+    max_grad_norm: float = 0.3
+    weight_decay: float = 0.01
+    lr_scheduler_type: str = "linear"
+    seed: int = 3407
 
 
 class LoraConfig(AppBaseModel):
@@ -884,6 +906,9 @@ class CallbackConfig(AppBaseModel):
     url: Optional[str] = None
     timeout_sec: int = 15
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    retry_tries: int = 3
+    retry_delay: float = 2.0
+    retry_backoff: float = 2.0
 
     @property
     def active(self) -> bool:
@@ -895,6 +920,7 @@ class ReportingConfig(AppBaseModel):
     progress: CallbackConfig = Field(default_factory=CallbackConfig)
     final: CallbackConfig = Field(default_factory=CallbackConfig)
     logs: CallbackConfig = Field(default_factory=CallbackConfig)
+    heartbeat_interval: int = 30
 
 
 class EvaluationDatasetConfig(AppBaseModel):
@@ -956,7 +982,11 @@ class EvaluationConfig(AppBaseModel):
     gpu_memory_utilization: float = 0.9
     max_num_seqs: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
+    max_model_len: Optional[int] = 1024
     enforce_eager: bool = False
+
+    # Retry policy for eval worker
+    retry_tries: int = 3
 
     @model_validator(mode="after")
     def validate_enabled(self) -> "EvaluationConfig":
@@ -991,6 +1021,7 @@ class UploadConfig(AppBaseModel):
     repo_id_metadata: Optional[str] = None
     private: bool = True
     commit_message: str = "trainer-service upload"
+    retry_tries: int = 3
 
 
 class HuggingFacePublishConfig(AppBaseModel):
@@ -1003,6 +1034,7 @@ class HuggingFacePublishConfig(AppBaseModel):
     private: bool = True
     commit_message: str = "trainer-service upload"
     revision: Optional[str] = None
+    retry_tries: int = 3
 
 
 class PipelineStage(AppBaseModel):
@@ -1052,6 +1084,9 @@ class JobConfig(AppBaseModel):
     job_id: Optional[str] = None
     job_name: str
     mode: Literal["local", "remote", "auto"] = "auto"
+    seed: int = 3407
+    tags: List[str] = Field(default_factory=list)
+    executor_identity: Optional[str] = None
 
     model: ModelConfig
     dataset: DatasetConfig
@@ -1287,11 +1322,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from urllib.parse import urlparse
+import logging
 
 import requests
 
 from ..bootstrap.schemas import JobConfig
+from .utils import retry
 
+logger = logging.getLogger(__name__)
 
 class AssetManager:
     def __init__(self, cfg: JobConfig):
@@ -1303,8 +1341,9 @@ class AssetManager:
         suffix = Path(parsed.path).suffix
         return suffix or default_suffix
 
+    @retry(tries=3, delay=5, backoff=2, logger=logger)
     def download_file(self, url: str, dest_path: Path) -> Path:
-        print(f"==> downloading {url} to {dest_path}")
+        logger.info("==> downloading %s to %s", url, dest_path)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         with requests.get(url, stream=True, timeout=120) as response:
@@ -1335,7 +1374,7 @@ class AssetManager:
             self.download_file(cfg.dataset.val_url, val_path)
             cfg.dataset.val_path = str(val_path)
 
-        print("==> dataset prepared")
+        logger.info("==> dataset prepared")
 
     def prepare_evaluation_dataset(self, cfg: JobConfig) -> None:
         if not cfg.evaluation.enabled or not cfg.evaluation.dataset:
@@ -1357,7 +1396,7 @@ class AssetManager:
         self.download_file(eval_cfg.url, eval_path)
         eval_cfg.path = str(eval_path)
 
-        print("==> evaluation dataset prepared")
+        logger.info("==> evaluation dataset prepared")
 
 
 path: /app/pipeline/eval_runner.py
@@ -1373,6 +1412,7 @@ from typing import Any, Dict, Optional
 
 from ..adapters.reporter import Reporter
 from ..bootstrap.schemas import JobConfig
+from .utils import cleanup_runtime, check_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -1399,6 +1439,60 @@ def _build_worker_payload(cfg: JobConfig, training_result: Dict[str, Any]) -> Di
     }
 
 
+def _is_retryable_vllm_error(stderr: str) -> bool:
+    text = (stderr or "").lower()
+    markers = [
+        "free memory on device cuda",
+        "decrease gpu memory utilization",
+        "engine core initialization failed",
+        "cuda out of memory",
+        "out of memory",
+    ]
+    return any(marker in text for marker in markers)
+
+
+def _attempt_overrides(cfg: JobConfig) -> list[dict]:
+    base_max_len = cfg.evaluation.max_model_len or 1024
+
+    return [
+        {
+            "gpu_memory_utilization": 0.72,
+            "max_num_seqs": 2,
+            "max_num_batched_tokens": min(1024, base_max_len),
+            "max_model_len": min(base_max_len, 1024),
+            "batch_size": 2,
+        },
+        {
+            "gpu_memory_utilization": 0.68,
+            "max_num_seqs": 2,
+            "max_num_batched_tokens": min(768, base_max_len),
+            "max_model_len": min(base_max_len, 768),
+            "batch_size": 2,
+        },
+        {
+            "gpu_memory_utilization": 0.64,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": min(512, base_max_len),
+            "max_model_len": min(base_max_len, 512),
+            "batch_size": 1,
+        },
+        {
+            "gpu_memory_utilization": 0.58,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": min(384, base_max_len),
+            "max_model_len": min(base_max_len, 384),
+            "batch_size": 1,
+        },
+        {
+            "gpu_memory_utilization": 0.52,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": min(256, base_max_len),
+            "max_model_len": min(base_max_len, 256),
+            "batch_size": 1,
+        },
+    ]
+
+
 def run_evaluation(
     cfg: JobConfig,
     training_result: Dict[str, Any],
@@ -1417,10 +1511,6 @@ def run_evaluation(
     request_path = output_dir / "worker-request.json"
     response_path = output_dir / "worker-response.json"
 
-    payload = _build_worker_payload(cfg, training_result)
-    with request_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-
     if reporter:
         reporter.report_status(
             "running",
@@ -1430,81 +1520,114 @@ def run_evaluation(
             extra={
                 "engine": cfg.evaluation.engine,
                 "task": ds_cfg.task,
-                "batch_size": cfg.evaluation.batch_size,
-                "max_num_seqs": cfg.evaluation.max_num_seqs,
-                "max_num_batched_tokens": cfg.evaluation.max_num_batched_tokens,
-                "worker_python": VLLM_PYTHON_BIN,
             },
         )
 
-    cmd = [
-        VLLM_PYTHON_BIN,
-        _worker_script_path(),
-        "--request",
-        str(request_path),
-        "--response",
-        str(response_path),
-    ]
+    cleanup_runtime("pre-evaluation")
+    check_gpu_memory(min_free_gb=1.0) # Just a warning if low
 
-    logger.info("==> starting evaluation worker: %s", " ".join(cmd))
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="evaluation",
-            progress=1,
-            message="evaluation worker started",
-            extra={
-                "engine": cfg.evaluation.engine,
-                "worker_python": VLLM_PYTHON_BIN,
-            },
+    attempts = _attempt_overrides(cfg)
+    last_error = None
+
+    # Limit attempts by config
+    max_attempts = min(len(attempts), cfg.evaluation.retry_tries)
+
+    for idx in range(1, max_attempts + 1):
+        override = attempts[idx-1]
+        cleanup_runtime(f"pre-evaluation-attempt-{idx}")
+
+        eval_cfg = cfg.model_copy(deep=True)
+        eval_cfg.evaluation.gpu_memory_utilization = override["gpu_memory_utilization"]
+        eval_cfg.evaluation.max_num_seqs = override["max_num_seqs"]
+        eval_cfg.evaluation.max_num_batched_tokens = override["max_num_batched_tokens"]
+        eval_cfg.evaluation.max_model_len = override["max_model_len"]
+        eval_cfg.evaluation.batch_size = override["batch_size"]
+
+        payload = _build_worker_payload(eval_cfg, training_result)
+        with request_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        cmd = [
+            VLLM_PYTHON_BIN,
+            _worker_script_path(),
+            "--request",
+            str(request_path),
+            "--response",
+            str(response_path),
+        ]
+
+        logger.info(
+            "==> evaluation attempt %s/%s: gpu_memory_utilization=%s max_num_seqs=%s max_num_batched_tokens=%s max_model_len=%s",
+            idx,
+            max_attempts,
+            override["gpu_memory_utilization"],
+            override["max_num_seqs"],
+            override["max_num_batched_tokens"],
+            override["max_model_len"],
         )
+        logger.info("==> starting evaluation worker: %s", " ".join(cmd))
 
-    try:
-        process = subprocess.run(
-            cmd,
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"vLLM python interpreter not found: {VLLM_PYTHON_BIN}. "
-            "Make sure Docker image created /opt/vllm-venv."
-        ) from exc
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="evaluation",
+                progress=1,
+                message=f"evaluation attempt {idx}/{max_attempts}",
+                extra=override,
+            )
 
-    if process.stdout:
-        logger.info("==> evaluation worker stdout:\n%s", process.stdout.strip())
-    if process.stderr:
-        logger.warning("==> evaluation worker stderr:\n%s", process.stderr.strip())
+        try:
+            process = subprocess.run(
+                cmd,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"vLLM python interpreter not found: {VLLM_PYTHON_BIN}. "
+                "Make sure Docker image created /opt/vllm-venv."
+            ) from exc
 
-    if process.returncode != 0:
-        raise RuntimeError(
-            "Evaluation worker failed with exit code "
-            f"{process.returncode}. stderr: {process.stderr.strip() or '<empty>'}"
-        )
+        if process.stdout:
+            logger.info("==> evaluation worker stdout:\n%s", process.stdout.strip())
+        if process.stderr:
+            logger.warning("==> evaluation worker stderr:\n%s", process.stderr.strip())
 
-    if not response_path.exists():
-        raise RuntimeError(f"Evaluation worker did not create response file: {response_path}")
+        cleanup_runtime(f"post-evaluation-attempt-{idx}")
 
-    with response_path.open("r", encoding="utf-8") as f:
-        result = json.load(f)
+        if process.returncode == 0 and response_path.exists():
+            with response_path.open("r", encoding="utf-8") as f:
+                result = json.load(f)
 
-    if not isinstance(result, dict):
-        raise RuntimeError("Evaluation worker returned invalid response payload")
+            if not isinstance(result, dict):
+                raise RuntimeError("Evaluation worker returned invalid response payload")
 
-    if result.get("status") == "failed":
-        raise RuntimeError(result.get("error") or "Evaluation worker reported failure")
+            if result.get("status") == "failed":
+                last_error = result.get("error") or "Evaluation worker reported failure"
+            else:
+                if reporter:
+                    reporter.report_status(
+                        "running",
+                        stage="evaluation_completed",
+                        progress=100,
+                        message="evaluation completed",
+                        extra=result.get("summary") or {},
+                    )
+                return result
+        else:
+            last_error = (
+                f"Evaluation worker failed with exit code {process.returncode}. "
+                f"stderr: {process.stderr.strip() or '<empty>'}"
+            )
 
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="evaluation_completed",
-            progress=100,
-            message="evaluation completed",
-            extra=result.get("summary") or {},
-        )
+        if idx < max_attempts and _is_retryable_vllm_error(process.stderr):
+            logger.warning("==> retryable vLLM failure detected, retrying with smaller memory settings")
+            continue
 
-    return result
+        break
+
+    raise RuntimeError(last_error or "Evaluation failed after all retry attempts")
 
 
 path: /app/pipeline/publish_runner.py
@@ -1518,6 +1641,7 @@ from huggingface_hub import HfApi
 
 from ..adapters.hf_utils import build_hf_api, get_hf_token
 from ..bootstrap.schemas import JobConfig
+from .utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -1658,7 +1782,8 @@ class PublishRunner:
         repo_dir = Path(folder_path)
         readme_path = repo_dir / "README.md"
         if not readme_path.exists():
-            return
+            # Create a simple README.md if it doesn't exist
+            readme_path.write_text(f"# {self.cfg.job_name}\n\nFine-tuned model.", encoding="utf-8")
 
         base_model_id = self._resolve_hf_base_model_id(training_result)
         changed = self._rewrite_readme_frontmatter_base_model(readme_path, base_model_id)
@@ -1711,6 +1836,11 @@ class PublishRunner:
             else self.cfg.upload.commit_message
         )
         revision = self.cfg.huggingface.revision
+        retry_tries = (
+            self.cfg.huggingface.retry_tries
+            if self.cfg.huggingface.enabled
+            else self.cfg.upload.retry_tries
+        )
 
         return {
             "request_lora": request_lora,
@@ -1722,6 +1852,7 @@ class PublishRunner:
             "private": private,
             "commit_message": commit_message,
             "revision": revision,
+            "retry_tries": retry_tries,
         }
 
     def ensure_hf_ready(self) -> Dict[str, Any]:
@@ -1763,21 +1894,25 @@ class PublishRunner:
 
             self._normalize_model_card_metadata(lora_dir, training_result)
 
-            api.create_repo(
-                repo_id=plan["lora_repo"],
-                repo_type="model",
-                private=plan["private"],
-                exist_ok=True,
-            )
-            api.upload_folder(
-                repo_id=plan["lora_repo"],
-                repo_type="model",
-                folder_path=lora_dir,
-                commit_message=plan["commit_message"],
-                revision=plan["revision"],
-                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
-            )
-            uploaded["hf_lora"] = {"repo_id": plan["lora_repo"], "path": lora_dir}
+            @retry(tries=plan["retry_tries"], delay=10, backoff=2, logger=logger)
+            def _do_lora_upload():
+                api.create_repo(
+                    repo_id=plan["lora_repo"],
+                    repo_type="model",
+                    private=plan["private"],
+                    exist_ok=True,
+                )
+                api.upload_folder(
+                    repo_id=plan["lora_repo"],
+                    repo_type="model",
+                    folder_path=lora_dir,
+                    commit_message=plan["commit_message"],
+                    revision=plan["revision"],
+                    ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+                )
+                return {"repo_id": plan["lora_repo"], "path": lora_dir}
+
+            uploaded["hf_lora"] = _do_lora_upload()
 
         if plan["request_merged"]:
             merged_dir = training_result.get("merged_dir")
@@ -1786,21 +1921,25 @@ class PublishRunner:
 
             self._normalize_model_card_metadata(merged_dir, training_result)
 
-            api.create_repo(
-                repo_id=plan["merged_repo"],
-                repo_type="model",
-                private=plan["private"],
-                exist_ok=True,
-            )
-            api.upload_folder(
-                repo_id=plan["merged_repo"],
-                repo_type="model",
-                folder_path=merged_dir,
-                commit_message=plan["commit_message"],
-                revision=plan["revision"],
-                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
-            )
-            uploaded["hf_merged"] = {"repo_id": plan["merged_repo"], "path": merged_dir}
+            @retry(tries=plan["retry_tries"], delay=20, backoff=2, logger=logger)
+            def _do_merged_upload():
+                api.create_repo(
+                    repo_id=plan["merged_repo"],
+                    repo_type="model",
+                    private=plan["private"],
+                    exist_ok=True,
+                )
+                api.upload_folder(
+                    repo_id=plan["merged_repo"],
+                    repo_type="model",
+                    folder_path=merged_dir,
+                    commit_message=plan["commit_message"],
+                    revision=plan["revision"],
+                    ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+                )
+                return {"repo_id": plan["merged_repo"], "path": merged_dir}
+
+            uploaded["hf_merged"] = _do_merged_upload()
 
         return uploaded
 
@@ -1812,20 +1951,25 @@ class PublishRunner:
         path_in_repo: str,
         commit_message: str,
         revision: Optional[str] = None,
+        retry_tries: int = 3,
     ) -> Optional[str]:
         path = Path(file_path)
         if not path.exists():
             return None
 
-        api.upload_file(
-            path_or_fileobj=str(path),
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type="model",
-            commit_message=commit_message,
-            revision=revision,
-        )
-        return path_in_repo
+        @retry(tries=retry_tries, delay=5, backoff=2, logger=logger)
+        def _do_upload():
+            api.upload_file(
+                path_or_fileobj=str(path),
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=commit_message,
+                revision=revision,
+            )
+            return path_in_repo
+
+        return _do_upload()
 
     def upload_hf_metadata(
         self,
@@ -1855,6 +1999,7 @@ class PublishRunner:
 
         commit_message = f"{plan['commit_message']} (metadata)"
         revision = plan["revision"]
+        retry_tries = plan["retry_tries"]
 
         uploaded_files: list[str] = []
 
@@ -1903,6 +2048,7 @@ class PublishRunner:
                 path_in_repo=path_in_repo,
                 commit_message=commit_message,
                 revision=revision,
+                retry_tries=retry_tries,
             )
             if uploaded_path:
                 uploaded_files.append(uploaded_path)
@@ -1918,11 +2064,11 @@ path: /app/pipeline/train_runner.py
 ----------------------------------------
 from __future__ import annotations
 
+import gc
 import inspect
 import json
 import logging
 import math
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -1930,13 +2076,13 @@ import unsloth  # noqa: F401
 from unsloth import FastLanguageModel
 
 import torch
-import os
 from datasets import load_dataset
 from transformers import TrainerCallback, TrainingArguments
 from trl import SFTTrainer
 
 from ..adapters.reporter import Reporter
 from ..bootstrap.schemas import JobConfig
+from .utils import cleanup_runtime, check_disk_space, check_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -2109,11 +2255,14 @@ def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bo
         "optim": cfg.training.optim,
         "push_to_hub": False,
         "logging_dir": cfg.outputs.logs_dir,
+        "max_grad_norm": cfg.training.max_grad_norm,
+        "weight_decay": cfg.training.weight_decay,
+        "lr_scheduler_type": cfg.training.lr_scheduler_type,
+        "seed": cfg.training.seed or cfg.seed,
     }
 
     sig = inspect.signature(TrainingArguments.__init__)
     supported = set(sig.parameters.keys())
-
     filtered_kwargs = {k: v for k, v in common_kwargs.items() if k in supported}
 
     if "report_to" in supported:
@@ -2122,7 +2271,6 @@ def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bo
     if has_validation:
         if "eval_steps" in supported:
             filtered_kwargs["eval_steps"] = cfg.training.eval_steps
-
         if "eval_strategy" in supported:
             filtered_kwargs["eval_strategy"] = "steps"
         elif "evaluation_strategy" in supported:
@@ -2178,6 +2326,13 @@ def _build_sft_trainer(
 
 def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
     ensure_dirs(cfg)
+    check_disk_space(cfg.outputs.base_dir, min_free_gb=10.0)
+    check_gpu_memory(min_free_gb=2.0)
+
+    model = None
+    tokenizer = None
+    dataset = None
+    trainer = None
 
     model_name, load_in_4bit, logical_base_model_id = resolve_model_args(cfg)
 
@@ -2186,213 +2341,233 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
         logger.info("==> logical base model id: %s", logical_base_model_id)
     logger.info("==> method: %s", cfg.training.method)
 
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="load_model",
-            progress=5,
-            message="loading base model",
-            extra={
-                "model_name": model_name,
-                "logical_base_model_id": logical_base_model_id,
-                "load_in_4bit": load_in_4bit,
-                "dtype": cfg.model.dtype,
-            },
-        )
-
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
-        dtype=torch.bfloat16 if cfg.training.bf16 else None,
-        load_in_4bit=load_in_4bit,
-        local_files_only=(cfg.model.source == "local"),
-        trust_remote_code=cfg.model.trust_remote_code,
-        device_map="auto",
-    )
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if getattr(tokenizer, "padding_side", None) != "right":
-        tokenizer.padding_side = "right"
-
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=cfg.lora.r,
-        target_modules=cfg.lora.target_modules,
-        lora_alpha=cfg.lora.lora_alpha,
-        lora_dropout=cfg.lora.lora_dropout,
-        bias=cfg.lora.bias,
-        use_gradient_checkpointing=cfg.lora.use_gradient_checkpointing,
-        random_state=cfg.lora.random_state,
-    )
-
-    if not cfg.dataset.train_path:
-        raise ValueError("dataset.train_path is required for training")
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="load_dataset",
-            progress=15,
-            message="loading dataset",
-        )
-
-    data_files = {"train": cfg.dataset.train_path}
-    if cfg.dataset.val_path:
-        data_files["validation"] = cfg.dataset.val_path
-
-    dataset = load_dataset("json", data_files=data_files)
-
-    dataset = dataset.map(
-        lambda example: format_example(example, cfg, tokenizer),
-        desc="Formatting dataset",
-    )
-    dataset = dataset.filter(
-        lambda row: bool(str(row.get("text", "")).strip()),
-        desc="Filtering empty rows",
-    )
-
-    if len(dataset["train"]) == 0:
-        raise ValueError("Train dataset is empty after formatting/filtering")
-
-    checkpoint_dir = str(Path(cfg.outputs.checkpoints_dir) / cfg.job_name)
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-    training_args = _build_training_args(
-        cfg=cfg,
-        checkpoint_dir=checkpoint_dir,
-        has_validation="validation" in dataset,
-    )
-
-    trainer = _build_sft_trainer(
-        cfg=cfg,
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"] if "validation" in dataset else None,
-        training_args=training_args,
-    )
-
-    trainer.add_callback(TrainingProgressCallback(reporter))
-
-    logger.info("==> training started")
-    train_result = trainer.train()
-    logger.info("==> training finished")
-
-    lora_dir = Path(cfg.outputs.lora_dir) / cfg.job_name
-    merged_dir = Path(cfg.outputs.merged_dir) / cfg.job_name
-    metrics_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_metrics.json"
-    history_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_history.json"
-    train_summary_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_summary.json"
-
-    lora_dir.mkdir(parents=True, exist_ok=True)
-    merged_dir.mkdir(parents=True, exist_ok=True)
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="save_lora",
-            progress=92,
-            message="saving lora adapters",
-            extra={"path": str(lora_dir)},
-        )
-
-    logger.info("==> saving lora adapters to %s", lora_dir)
-    model.save_pretrained(str(lora_dir))
-    tokenizer.save_pretrained(str(lora_dir))
-
-    merged_saved = False
-    if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
+    try:
         if reporter:
             reporter.report_status(
                 "running",
-                stage="merge_lora",
-                progress=96,
-                message="saving merged model",
-                extra={"path": str(merged_dir)},
+                stage="load_model",
+                progress=5,
+                message="loading base model",
+                extra={
+                    "model_name": model_name,
+                    "logical_base_model_id": logical_base_model_id,
+                    "load_in_4bit": load_in_4bit,
+                    "dtype": cfg.model.dtype,
+                },
             )
 
-        logger.info("==> saving merged model to %s", merged_dir)
-        logger.info("==> merged 16-bit save may take several minutes for 7B model")
-        model.save_pretrained_merged(
-            save_directory=str(merged_dir),
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
+            dtype=torch.bfloat16 if cfg.training.bf16 else None,
+            load_in_4bit=load_in_4bit,
+            local_files_only=(cfg.model.source == "local"),
+            trust_remote_code=cfg.model.trust_remote_code,
+            device_map="auto",
+            revision=cfg.model.revision,
+        )
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if getattr(tokenizer, "padding_side", None) != "right":
+            tokenizer.padding_side = "right"
+
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=cfg.lora.r,
+            target_modules=cfg.lora.target_modules,
+            lora_alpha=cfg.lora.lora_alpha,
+            lora_dropout=cfg.lora.lora_dropout,
+            bias=cfg.lora.bias,
+            use_gradient_checkpointing=cfg.lora.use_gradient_checkpointing,
+            random_state=cfg.lora.random_state,
+        )
+
+        if not cfg.dataset.train_path:
+            raise ValueError("dataset.train_path is required for training")
+
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="load_dataset",
+                progress=15,
+                message="loading dataset",
+            )
+
+        data_files = {"train": cfg.dataset.train_path}
+        if cfg.dataset.val_path:
+            data_files["validation"] = cfg.dataset.val_path
+
+        dataset = load_dataset("json", data_files=data_files)
+
+        dataset = dataset.map(
+            lambda example: format_example(example, cfg, tokenizer),
+            desc="Formatting dataset",
+        )
+        dataset = dataset.filter(
+            lambda row: bool(str(row.get("text", "")).strip()),
+            desc="Filtering empty rows",
+        )
+
+        if len(dataset["train"]) == 0:
+            raise ValueError("Train dataset is empty after formatting/filtering")
+
+        checkpoint_dir = str(Path(cfg.outputs.checkpoints_dir) / cfg.job_name)
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+        training_args = _build_training_args(
+            cfg=cfg,
+            checkpoint_dir=checkpoint_dir,
+            has_validation="validation" in dataset,
+        )
+
+        trainer = _build_sft_trainer(
+            cfg=cfg,
+            model=model,
             tokenizer=tokenizer,
-            save_method="merged_16bit",
-        )
-        logger.info("==> merged model saved")
-        merged_saved = True
-
-    metrics = dict(train_result.metrics)
-    history = trainer.state.log_history
-
-    final_loss = None
-    for entry in reversed(history):
-        if "loss" in entry:
-            final_loss = entry["loss"]
-            break
-
-    train_summary = {
-        "job_name": cfg.job_name,
-        "train_rows": len(dataset["train"]),
-        "validation_rows": len(dataset["validation"]) if "validation" in dataset else 0,
-        "method": cfg.training.method,
-        "base_model": model_name,
-        "base_model_id": logical_base_model_id,
-        "base_model_name_or_path": logical_base_model_id,
-        "load_in_4bit": load_in_4bit,
-        "bf16": cfg.training.bf16,
-        "merged_saved": merged_saved,
-        "train_runtime": metrics.get("train_runtime"),
-        "train_samples_per_second": metrics.get("train_samples_per_second"),
-        "train_steps_per_second": metrics.get("train_steps_per_second"),
-        "train_loss": metrics.get("train_loss"),
-        "final_loss": final_loss,
-    }
-
-    with metrics_path.open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
-
-    with history_path.open("w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
-
-    with train_summary_path.open("w", encoding="utf-8") as f:
-        json.dump(train_summary, f, indent=2, ensure_ascii=False)
-
-    logger.info("==> training artifacts saved")
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="train_completed",
-            progress=100,
-            message="training stage completed",
-            extra=train_summary,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset["validation"] if "validation" in dataset else None,
+            training_args=training_args,
         )
 
-    try:
-        del trainer
-    except Exception:
-        pass
+        trainer.add_callback(TrainingProgressCallback(reporter))
 
-    try:
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
+        logger.info("==> training started")
+        train_result = trainer.train()
+        logger.info("==> training finished")
 
-    return {
-        "status": "success",
-        "job_name": cfg.job_name,
-        "base_model": model_name,
-        "base_model_id": logical_base_model_id,
-        "base_model_name_or_path": logical_base_model_id,
-        "lora_dir": str(lora_dir),
-        "merged_dir": str(merged_dir) if merged_saved else None,
-        "checkpoint_dir": checkpoint_dir,
-        "metrics_path": str(metrics_path),
-        "history_path": str(history_path),
-        "train_summary_path": str(train_summary_path),
-        "summary": train_summary,
-    }
+        lora_dir = Path(cfg.outputs.lora_dir) / cfg.job_name
+        merged_dir = Path(cfg.outputs.merged_dir) / cfg.job_name
+        metrics_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_metrics.json"
+        history_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_history.json"
+        train_summary_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_summary.json"
+
+        lora_dir.mkdir(parents=True, exist_ok=True)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="save_lora",
+                progress=92,
+                message="saving lora adapters",
+                extra={"path": str(lora_dir)},
+            )
+
+        logger.info("==> saving lora adapters to %s", lora_dir)
+        model.save_pretrained(str(lora_dir))
+        tokenizer.save_pretrained(str(lora_dir))
+
+        merged_saved = False
+        if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
+            check_disk_space(cfg.outputs.base_dir, min_free_gb=20.0)
+            if reporter:
+                reporter.report_status(
+                    "running",
+                    stage="merge_lora",
+                    progress=96,
+                    message="saving merged model",
+                    extra={"path": str(merged_dir)},
+                )
+
+            logger.info("==> saving merged model to %s", merged_dir)
+            logger.info("==> merged 16-bit save may take several minutes for 7B model")
+            model.save_pretrained_merged(
+                save_directory=str(merged_dir),
+                tokenizer=tokenizer,
+                save_method="merged_16bit",
+            )
+            logger.info("==> merged model saved")
+            merged_saved = True
+
+        metrics = dict(train_result.metrics)
+        history = trainer.state.log_history
+
+        final_loss = None
+        for entry in reversed(history):
+            if "loss" in entry:
+                final_loss = entry["loss"]
+                break
+
+        train_summary = {
+            "job_name": cfg.job_name,
+            "train_rows": len(dataset["train"]),
+            "validation_rows": len(dataset["validation"]) if "validation" in dataset else 0,
+            "method": cfg.training.method,
+            "base_model": model_name,
+            "base_model_id": logical_base_model_id,
+            "base_model_name_or_path": logical_base_model_id,
+            "load_in_4bit": load_in_4bit,
+            "bf16": cfg.training.bf16,
+            "merged_saved": merged_saved,
+            "train_runtime": metrics.get("train_runtime"),
+            "train_samples_per_second": metrics.get("train_samples_per_second"),
+            "train_steps_per_second": metrics.get("train_steps_per_second"),
+            "train_loss": metrics.get("train_loss"),
+            "final_loss": final_loss,
+        }
+
+        with metrics_path.open("w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+        with history_path.open("w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+
+        with train_summary_path.open("w", encoding="utf-8") as f:
+            json.dump(train_summary, f, indent=2, ensure_ascii=False)
+
+        logger.info("==> training artifacts saved")
+
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="train_completed",
+                progress=100,
+                message="training stage completed",
+                extra=train_summary,
+            )
+
+        return {
+            "status": "success",
+            "job_name": cfg.job_name,
+            "base_model": model_name,
+            "base_model_id": logical_base_model_id,
+            "base_model_name_or_path": logical_base_model_id,
+            "lora_dir": str(lora_dir),
+            "merged_dir": str(merged_dir) if merged_saved else None,
+            "checkpoint_dir": checkpoint_dir,
+            "metrics_path": str(metrics_path),
+            "history_path": str(history_path),
+            "train_summary_path": str(train_summary_path),
+            "summary": train_summary,
+        }
+
+    finally:
+        try:
+            if trainer is not None:
+                del trainer
+        except Exception:
+            pass
+
+        try:
+            if dataset is not None:
+                del dataset
+        except Exception:
+            pass
+
+        try:
+            if model is not None:
+                del model
+        except Exception:
+            pass
+
+        try:
+            if tokenizer is not None:
+                del tokenizer
+        except Exception:
+            pass
+
+        cleanup_runtime("training")
 
 
 path: /app/pipeline/upload_runner.py
@@ -2403,6 +2578,7 @@ from typing import Any, Callable, Dict, Tuple
 
 from .archiver import Archiver
 from ..bootstrap.schemas import JobConfig
+from .utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -2425,23 +2601,26 @@ class UploadRunner:
         if not upload_url or not path.exists():
             return {}
 
-        with path.open("rb") as f:
-            files = {"file": (path.name, f, "application/octet-stream")}
-            data = {
-                "job_id": self.cfg.job_id or self.cfg.job_name,
-                "job_name": self.cfg.job_name,
-                "artifact_type": artifact_type,
-            }
-            response = self.session.post(
-                upload_url,
-                files=files,
-                data=data,
-                headers=self._headers(),
-                timeout=(10, self.cfg.upload.timeout_sec),
-            )
-            response.raise_for_status()
+        @retry(tries=self.cfg.upload.retry_tries, delay=5, backoff=2, logger=logger)
+        def _do_upload():
+            with path.open("rb") as f:
+                files = {"file": (path.name, f, "application/octet-stream")}
+                data = {
+                    "job_id": self.cfg.job_id or self.cfg.job_name,
+                    "job_name": self.cfg.job_name,
+                    "artifact_type": artifact_type,
+                }
+                response = self.session.post(
+                    upload_url,
+                    files=files,
+                    data=data,
+                    headers=self._headers(),
+                    timeout=(10, self.cfg.upload.timeout_sec),
+                )
+                response.raise_for_status()
+            return {"url": upload_url, "path": str(path)}
 
-        return {"url": upload_url, "path": str(path)}
+        return _do_upload()
 
     def _archive_and_upload_dir(
         self,
@@ -2460,18 +2639,23 @@ class UploadRunner:
             str(archive_path),
             exclude_names={"downloads", "__pycache__"},
         )
-        self.archiver.upload_archive(
-            str(archive_path),
-            upload_url,
-            headers=self._headers(),
-            form_data={
-                "job_id": self.cfg.job_id or self.cfg.job_name,
-                "job_name": self.cfg.job_name,
-                "artifact_type": artifact_type,
-            },
-            timeout_sec=self.cfg.upload.timeout_sec,
-        )
-        return {"url": upload_url, "archive_path": str(archive_path)}
+
+        @retry(tries=self.cfg.upload.retry_tries, delay=10, backoff=2, logger=logger)
+        def _do_upload():
+            self.archiver.upload_archive(
+                str(archive_path),
+                upload_url,
+                headers=self._headers(),
+                form_data={
+                    "job_id": self.cfg.job_id or self.cfg.job_name,
+                    "job_name": self.cfg.job_name,
+                    "artifact_type": artifact_type,
+                },
+                timeout_sec=self.cfg.upload.timeout_sec,
+            )
+            return {"url": upload_url, "archive_path": str(archive_path)}
+
+        return _do_upload()
 
     def _safe_upload(
         self,
@@ -2630,6 +2814,127 @@ class UploadRunner:
         return uploaded
 
 
+path: /app/pipeline/utils.py
+----------------------------------------
+from __future__ import annotations
+
+import gc
+import logging
+import shutil
+import time
+from functools import wraps
+from pathlib import Path
+from typing import Any, Callable, TypeVar
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+def retry(
+    exceptions: tuple[type[Exception], ...] = (Exception,),
+    tries: int = 3,
+    delay: float = 2.0,
+    backoff: float = 2.0,
+    logger: logging.Logger | None = None,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Retry decorator with exponential backoff.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            mtries, mdelay = tries, delay
+            while mtries > 1:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    msg = f"{str(e)}, Retrying in {mdelay} seconds..."
+                    if logger:
+                        logger.warning(msg)
+                    else:
+                        print(msg)
+                    time.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= backoff
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def cleanup_runtime(stage: str | None = None) -> None:
+    if stage:
+        logger.info("==> [cleanup] stage: %s", stage)
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception as e:
+            logger.warning("Error during GPU cleanup: %s", e)
+
+def get_disk_usage(path: str | Path) -> dict[str, float]:
+    total, used, free = shutil.disk_usage(path)
+    return {
+        "total_gb": total / (1024**3),
+        "used_gb": used / (1024**3),
+        "free_gb": free / (1024**3),
+    }
+
+def check_disk_space(path: str | Path, min_free_gb: float = 5.0) -> bool:
+    usage = get_disk_usage(path)
+    free_gb = usage["free_gb"]
+    if free_gb < min_free_gb:
+        logger.warning("Low disk space on %s: %.2f GB free, required %.2f GB", path, free_gb, min_free_gb)
+        return False
+    return True
+
+def get_gpu_memory() -> list[dict[str, float]]:
+    if not torch.cuda.is_available():
+        return []
+
+    memos = []
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        total = props.total_memory
+        reserved = torch.cuda.memory_reserved(i)
+        allocated = torch.cuda.memory_allocated(i)
+        free = total - allocated # This is not strictly true as some might be used by other processes
+
+        # More accurate free memory using torch.cuda.mem_get_info
+        try:
+            free_info, total_info = torch.cuda.mem_get_info(i)
+            free = free_info
+        except Exception:
+            pass
+
+        memos.append({
+            "device": i,
+            "total_gb": total / (1024**3),
+            "free_gb": free / (1024**3),
+            "allocated_gb": allocated / (1024**3),
+            "reserved_gb": reserved / (1024**3),
+        })
+    return memos
+
+def check_gpu_memory(min_free_gb: float = 2.0) -> bool:
+    memos = get_gpu_memory()
+    if not memos:
+        return True # Assume OK if no GPU (though training will likely fail later)
+
+    for memo in memos:
+        if memo["free_gb"] < min_free_gb:
+            logger.warning("Low GPU memory on device %d: %.2f GB free, required %.2f GB", memo["device"], memo["free_gb"], min_free_gb)
+            return False
+    return True
+
+
 path: /app/pipeline/vllm_eval_worker.py
 ----------------------------------------
 from __future__ import annotations
@@ -2683,6 +2988,42 @@ def _normalize_tags(value: Any) -> List[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+def _sanitize_tokenizer_config(model_dir: str) -> None:
+    model_path = Path(model_dir)
+    config_path = model_path / "tokenizer_config.json"
+
+    if not config_path.exists():
+        return
+
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        logger.warning("failed to read tokenizer config %s: %s", config_path, exc)
+        return
+
+    changed = False
+
+    extra_special_tokens = data.get("extra_special_tokens")
+    if isinstance(extra_special_tokens, list):
+        additional = data.get("additional_special_tokens")
+        if not isinstance(additional, list):
+            additional = []
+
+        for token in extra_special_tokens:
+            token_str = str(token).strip()
+            if token_str and token_str not in additional:
+                additional.append(token_str)
+
+        data["additional_special_tokens"] = additional
+        data.pop("extra_special_tokens", None)
+        changed = True
+
+    if changed:
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info("sanitized tokenizer config: %s", config_path)
 
 
 def render_prompt_template(template: str, sample: Dict[str, Any]) -> str:
@@ -3070,6 +3411,9 @@ def _build_vllm_runtime(payload: Dict[str, Any]):
     if eval_cfg.get("max_num_batched_tokens"):
         engine_args["max_num_batched_tokens"] = int(eval_cfg["max_num_batched_tokens"])
 
+    if eval_cfg.get("max_model_len"):
+        engine_args["max_model_len"] = int(eval_cfg["max_model_len"])
+
     lora_request = None
 
     if resolved_target == "merged":
@@ -3328,6 +3672,32 @@ def run_worker(request: Dict[str, Any]) -> Dict[str, Any]:
     return result_payload
 
 
+def _cleanup_worker_runtime() -> None:
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", required=True)
@@ -3356,6 +3726,8 @@ def main() -> None:
             json.dump(error_payload, f, indent=2, ensure_ascii=False)
         print(error_payload["traceback"], file=sys.stderr)
         sys.exit(1)
+    finally:
+        _cleanup_worker_runtime()
 
 
 if __name__ == "__main__":
@@ -3368,7 +3740,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import gc
 import json
 import logging
 import sys
@@ -3385,10 +3756,10 @@ from .adapters.log_streamer import LogStreamer
 from .adapters.reporter import Reporter
 from .bootstrap.bootstrap_loader import load_remote_job_config
 from .bootstrap.config_loader import load_config, load_config_bundle
-from .pipeline.archiver import Archiver
 from .pipeline.asset_manager import AssetManager
 from .pipeline.publish_runner import PublishRunner
 from .pipeline.upload_runner import UploadRunner
+from .pipeline.utils import cleanup_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -3471,11 +3842,11 @@ def teardown_logging(handlers: List[logging.Handler]) -> None:
             pass
 
 
-def start_heartbeat(reporter: Reporter) -> Tuple[Event, Thread]:
+def start_heartbeat(reporter: Reporter, interval: int = 30) -> Tuple[Event, Thread]:
     stop_event = Event()
 
     def heartbeat_loop():
-        while not stop_event.wait(30):
+        while not stop_event.wait(interval):
             try:
                 reporter.report_status(
                     "running",
@@ -3499,6 +3870,280 @@ def stop_heartbeat(stop_event: Optional[Event], thread: Optional[Thread]) -> Non
             thread.join(timeout=1.0)
         except Exception:
             pass
+
+
+def apply_run_output_paths(cfg) -> Tuple[str, Path]:
+    run_name = f"{cfg.job_name}_{utc_compact_timestamp()}"
+    base_root = Path(cfg.outputs.base_dir)
+    run_root = base_root / run_name
+
+    cfg.outputs.base_dir = str(run_root)
+    cfg.outputs.logs_dir = str(run_root / "logs")
+    cfg.outputs.lora_dir = str(run_root / "lora")
+    cfg.outputs.checkpoints_dir = str(run_root / "checkpoints")
+    cfg.outputs.metrics_dir = str(run_root / "metrics")
+    cfg.outputs.merged_dir = str(run_root / "merged")
+    cfg.outputs.quantized_dir = str(run_root / "quantized")
+    cfg.outputs.eval_dir = str(run_root / "evaluation")
+    cfg.outputs.downloads_dir = str(run_root / "downloads")
+
+    return run_name, run_root
+
+
+class Pipeline:
+    def __init__(self, cfg: Any, config_source: str, bootstrap_meta: Optional[Dict[str, Any]] = None):
+        self.cfg = copy.deepcopy(cfg)
+        self.config_source = config_source
+        self.bootstrap_meta = bootstrap_meta or {}
+        self.run_name, self.run_root = apply_run_output_paths(self.cfg)
+
+        # Override config reporting with bootstrap meta if present
+        if self.bootstrap_meta.get("status_url"):
+            self.cfg.reporting.status.url = self.bootstrap_meta["status_url"]
+            self.cfg.reporting.status.enabled = True
+        if self.bootstrap_meta.get("progress_url"):
+            self.cfg.reporting.progress.url = self.bootstrap_meta["progress_url"]
+            self.cfg.reporting.progress.enabled = True
+        if self.bootstrap_meta.get("final_url"):
+            self.cfg.reporting.final.url = self.bootstrap_meta["final_url"]
+            self.cfg.reporting.final.enabled = True
+        if self.bootstrap_meta.get("logs_url"):
+            self.cfg.reporting.logs.url = self.bootstrap_meta["logs_url"]
+            self.cfg.reporting.logs.enabled = True
+
+        auth_token = self.bootstrap_meta.get("callback_auth_token")
+        if auth_token:
+            for cb in [self.cfg.reporting.status, self.cfg.reporting.progress, self.cfg.reporting.final, self.cfg.reporting.logs]:
+                if not cb.auth.bearer_token:
+                    cb.auth.bearer_token = auth_token
+
+        self.log_file, self.log_handlers = setup_logging(
+            self.cfg.outputs.logs_dir,
+            job_id=self.cfg.job_id or self.cfg.job_name,
+            job_name=self.cfg.job_name,
+            logs_url=self.cfg.reporting.logs.url if self.cfg.reporting.logs.enabled else None,
+            logs_bearer_token=self.cfg.reporting.logs.auth.bearer_token,
+        )
+
+        self.reporter = Reporter(self.cfg)
+        self.asset_manager = AssetManager(self.cfg)
+        self.uploader = UploadRunner(self.cfg)
+        self.publisher = PublishRunner(self.cfg)
+
+        self.heartbeat_stop, self.heartbeat_thread = start_heartbeat(
+            self.reporter,
+            interval=self.cfg.reporting.heartbeat_interval
+        )
+
+        self.effective_config_path = Path(self.cfg.outputs.logs_dir) / "effective-job.json"
+        self.result_path = Path(self.cfg.outputs.base_dir) / "job-result.json"
+
+        self.started_at = utc_now_iso()
+        self.training_result: Dict[str, Any] = {}
+        self.evaluation_result: Optional[Dict[str, Any]] = None
+        self.result: Dict[str, Any] = {
+            "status": "started",
+            "job_id": self.cfg.job_id or self.cfg.job_name,
+            "job_name": self.cfg.job_name,
+            "run_name": self.run_name,
+            "started_at": self.started_at,
+            "finished_at": None,
+            "config_source": self.config_source,
+            "training": {},
+            "evaluation": None,
+            "artifacts": {
+                "run_root": str(self.run_root),
+                "log_file": str(self.log_file),
+                "effective_config_path": str(self.effective_config_path),
+                "result_path": str(self.result_path),
+            },
+            "uploads": {},
+            "upload_errors": {},
+            "externalRefs": [],
+        }
+
+    def run(self) -> Dict[str, Any]:
+        try:
+            self.reporter.report_status(
+                "started",
+                message="Training pipeline started",
+                stage="bootstrap",
+                progress=0,
+            )
+
+            write_json(self.effective_config_path, json.loads(self.cfg.model_dump_json()))
+            logger.info("==> config loaded")
+            logger.info("==> job_name: %s", self.cfg.job_name)
+            logger.info("==> run_name: %s", self.run_name)
+            logger.info("==> job_id: %s", self.cfg.job_id or self.cfg.job_name)
+            logger.info("==> config source: %s", self.config_source)
+            logger.info("==> run output dir: %s", self.run_root)
+
+            self.reporter.report_status(
+                "running",
+                message="Validating Hugging Face access",
+                stage="hf_login",
+                progress=2,
+            )
+            try_hf_login()
+            self.publisher.ensure_hf_ready()
+
+            pipeline_cfg = self.cfg.pipeline
+            has_steps = bool(pipeline_cfg and pipeline_cfg.steps)
+
+            if has_steps:
+                logger.info("==> executing pipeline steps")
+                for step in pipeline_cfg.steps:
+                    if step.enabled:
+                        self._execute_step(step.key, step.kind)
+                    else:
+                        logger.info("==> step %s disabled, skipping", step.key)
+            else:
+                logger.warning("==> pipeline.steps missing, falling back to legacy sequence")
+                self._run_legacy_sequence()
+
+            self._finalize_success()
+            return self.result
+
+        except Exception as exc:
+            return self._handle_error(exc)
+        finally:
+            self._cleanup()
+
+    def _execute_step(self, step_key: str, step_kind: str) -> None:
+        logger.info("==> running step: %s (kind: %s)", step_key, step_kind)
+
+        if step_kind == "prepare_assets":
+            self.reporter.report_status("running", message="Preparing assets", stage="prepare_assets", progress=5)
+            self.asset_manager.prepare_dataset(self.cfg)
+            self.asset_manager.prepare_evaluation_dataset(self.cfg)
+            cleanup_runtime("prepare-assets")
+
+        elif step_kind == "training":
+            from .pipeline.train_runner import run_training
+            self.training_result = run_training(self.cfg, reporter=self.reporter)
+            if self.cfg.model.logical_base_model_id and not self.training_result.get("base_model_id"):
+                self.training_result["base_model_id"] = self.cfg.model.logical_base_model_id
+            self.result["training"] = self.training_result
+            cleanup_runtime("training")
+
+        elif step_kind == "evaluation":
+            from .pipeline.eval_runner import run_evaluation
+            cleanup_runtime("pre-evaluation")
+            try:
+                self.evaluation_result = run_evaluation(self.cfg, self.training_result, reporter=self.reporter)
+                self.result["evaluation"] = self.evaluation_result
+            except Exception as e:
+                logger.error("Evaluation failed but continuing: %s", e)
+                self.result["evaluation_error"] = str(e)
+            cleanup_runtime("evaluation")
+
+        elif step_kind == "publish_hf":
+            self.reporter.report_status("running", message="Publishing to HF", stage="publish", progress=90)
+            try:
+                hf_model_uploads = self.publisher.upload_to_huggingface(self.training_result)
+                if hf_model_uploads:
+                    self.result["uploads"].update(hf_model_uploads)
+
+                hf_metadata_uploads = self.publisher.upload_hf_metadata(
+                    log_file=str(self.log_file),
+                    effective_config_path=str(self.effective_config_path),
+                    result_path=str(self.result_path),
+                    training_result=self.training_result,
+                    eval_result=self.evaluation_result,
+                )
+                if hf_metadata_uploads:
+                    self.result["uploads"].update(hf_metadata_uploads)
+            except Exception as e:
+                logger.error("Publishing to HF failed but continuing: %s", e)
+                self.result["upload_errors"]["huggingface"] = str(e)
+            cleanup_runtime("publish")
+
+        elif step_kind == "upload_artifacts":
+            self.reporter.report_status("running", message="Uploading artifacts", stage="upload", progress=95)
+            try:
+                extra_uploads, extra_upload_errors = self.uploader.upload_non_summary_artifacts(
+                    log_file=str(self.log_file),
+                    effective_config_path=str(self.effective_config_path),
+                    training_result=self.training_result,
+                    eval_result=self.evaluation_result,
+                )
+                if extra_uploads:
+                    self.result["uploads"].update(extra_uploads)
+                if extra_upload_errors:
+                    self.result["upload_errors"].update(extra_upload_errors)
+            except Exception as e:
+                logger.error("Uploading artifacts failed but continuing: %s", e)
+                self.result["upload_errors"]["artifacts"] = str(e)
+            cleanup_runtime("upload")
+
+    def _run_legacy_sequence(self) -> None:
+        p = self.cfg.pipeline
+        if not p or p.prepare_assets.enabled:
+            self._execute_step("prepare_assets", "prepare_assets")
+        if not p or p.training.enabled:
+            self._execute_step("training", "training")
+        if (p.evaluation.enabled if p else self.cfg.evaluation.enabled):
+            self._execute_step("evaluation", "evaluation")
+        if (p.publish.enabled if p else self.cfg.huggingface.enabled):
+            self._execute_step("publish", "publish_hf")
+        if (p.upload.enabled if p else self.cfg.upload.enabled):
+            self._execute_step("upload", "upload_artifacts")
+
+    def _finalize_success(self) -> None:
+        self.result["finished_at"] = utc_now_iso()
+        self.result["status"] = "success"
+        write_json(self.result_path, self.result)
+
+        p = self.cfg.pipeline
+        should_upload = p.upload.enabled if p else self.cfg.upload.enabled
+        if should_upload and self.cfg.upload.target == "url" and self.cfg.upload.url_targets.summary_url:
+            try:
+                summary_upload = self.uploader.upload_summary(str(self.result_path))
+                if summary_upload:
+                    self.result["uploads"].update(summary_upload)
+                    write_json(self.result_path, self.result)
+            except Exception as exc:
+                logger.exception("summary upload failed")
+                self.result["upload_errors"]["summary"] = str(exc)
+                write_json(self.result_path, self.result)
+
+        if self.result["upload_errors"]:
+            logger.warning("==> pipeline finished with upload warnings")
+
+        logger.info("==> pipeline finished successfully")
+        self.reporter.report_status(
+            "finished",
+            message="Training pipeline finished successfully",
+            stage="finished",
+            progress=100,
+        )
+        self.reporter.report_final(self.result, status="finished")
+
+    def _handle_error(self, exc: Exception) -> Dict[str, Any]:
+        error_msg = str(exc)
+        stack_trace = traceback.format_exc()
+
+        logger.error("FATAL ERROR: %s", error_msg)
+        logger.error(stack_trace)
+
+        self.result["status"] = "failed"
+        self.result["finished_at"] = utc_now_iso()
+        self.result["error"] = error_msg
+        write_json(self.result_path, self.result)
+
+        self.reporter.report_error(error_msg, logs=tail_file(self.log_file, 50))
+        self.reporter.report_final(self.result, status="failed")
+        return self.result
+
+    def _cleanup(self) -> None:
+        stop_heartbeat(self.heartbeat_stop, self.heartbeat_thread)
+        try:
+            self.reporter.close()
+        except Exception:
+            pass
+        teardown_logging(self.log_handlers)
+        cleanup_runtime("job-finalize")
 
 
 def resolve_single_remote_config(args) -> Tuple[Any, str, Dict[str, Any]]:
@@ -3525,281 +4170,10 @@ def resolve_config_list(args) -> Tuple[List[Any], str]:
     raise ValueError("Either --config or --job-config-url must be provided")
 
 
-def apply_run_output_paths(cfg) -> Tuple[str, Path]:
-    run_name = f"{cfg.job_name}_{utc_compact_timestamp()}"
-    base_root = Path(cfg.outputs.base_dir)
-    run_root = base_root / run_name
-
-    cfg.outputs.base_dir = str(run_root)
-    cfg.outputs.logs_dir = str(run_root / "logs")
-    cfg.outputs.lora_dir = str(run_root / "lora")
-    cfg.outputs.checkpoints_dir = str(run_root / "checkpoints")
-    cfg.outputs.metrics_dir = str(run_root / "metrics")
-    cfg.outputs.merged_dir = str(run_root / "merged")
-    cfg.outputs.quantized_dir = str(run_root / "quantized")
-    cfg.outputs.eval_dir = str(run_root / "evaluation")
-    cfg.outputs.downloads_dir = str(run_root / "downloads")
-
-    return run_name, run_root
-
-
-def cleanup_runtime() -> None:
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
 def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    bootstrap_meta = bootstrap_meta or {}
-    cfg = copy.deepcopy(cfg)
-
-    run_name, run_root = apply_run_output_paths(cfg)
-    Path(cfg.outputs.base_dir).mkdir(parents=True, exist_ok=True)
-
-    log_file, handlers = setup_logging(
-        cfg.outputs.logs_dir,
-        job_id=cfg.job_id or cfg.job_name,
-        job_name=cfg.job_name,
-        logs_url=bootstrap_meta.get("logs_url") or cfg.reporting.logs.url,
-        logs_bearer_token=(
-            bootstrap_meta.get("callback_auth_token")
-            or cfg.reporting.logs.auth.bearer_token
-            or cfg.reporting.status.auth.bearer_token
-            or cfg.reporting.progress.auth.bearer_token
-            or cfg.reporting.final.auth.bearer_token
-        ),
-    )
-
-    reporter = Reporter(cfg)
-    asset_manager = AssetManager(cfg)
-    archiver = Archiver()
-    uploader = UploadRunner(cfg)
-    publisher = PublishRunner(cfg)
-
-    heartbeat_stop, heartbeat_thread = start_heartbeat(reporter)
-
-    effective_config_path = Path(cfg.outputs.logs_dir) / "effective-job.json"
-    result_path = Path(cfg.outputs.base_dir) / "job-result.json"
-
-    started_at = utc_now_iso()
-
-    try:
-        reporter.report_status(
-            "started",
-            message="Training pipeline started",
-            stage="bootstrap",
-            progress=0,
-        )
-
-        write_json(effective_config_path, json.loads(cfg.model_dump_json()))
-        logger.info("==> config loaded")
-        logger.info("==> job_name: %s", cfg.job_name)
-        logger.info("==> run_name: %s", run_name)
-        logger.info("==> job_id: %s", cfg.job_id or cfg.job_name)
-        logger.info("==> config source: %s", config_source)
-        logger.info("==> run output dir: %s", run_root)
-
-        reporter.report_status(
-            "running",
-            message="Validating Hugging Face access",
-            stage="hf_login",
-            progress=2,
-        )
-        try_hf_login()
-        publisher.ensure_hf_ready()
-
-        pipeline = cfg.pipeline
-        has_steps = bool(pipeline and pipeline.steps)
-
-        if has_steps:
-            logger.info("==> executing pipeline steps")
-        else:
-            logger.warning("==> pipeline.steps missing, falling back to legacy sequence")
-
-        training_result: Dict[str, Any] = {}
-        evaluation_result: Optional[Dict[str, Any]] = None
-        external_refs: List[Dict[str, Any]] = []
-
-        result: Dict[str, Any] = {
-            "status": "success",
-            "job_id": cfg.job_id or cfg.job_name,
-            "job_name": cfg.job_name,
-            "run_name": run_name,
-            "started_at": started_at,
-            "finished_at": None,
-            "config_source": config_source,
-            "training": {},
-            "evaluation": None,
-            "artifacts": {
-                "run_root": str(run_root),
-                "log_file": str(log_file),
-                "effective_config_path": str(effective_config_path),
-                "result_path": str(result_path),
-            },
-            "uploads": {},
-            "upload_errors": {},
-            "externalRefs": external_refs,
-        }
-
-        def run_step(step_key: str, step_kind: str) -> None:
-            nonlocal training_result, evaluation_result
-
-            if step_kind == "prepare_assets":
-                logger.info("==> preparing assets")
-                reporter.report_status("running", message="Preparing assets", stage="prepare_assets", progress=5)
-                asset_manager.prepare_dataset(cfg)
-                asset_manager.prepare_evaluation_dataset(cfg)
-
-            elif step_kind == "training":
-                from .pipeline.train_runner import run_training
-
-                logger.info("==> starting training")
-                training_result = run_training(cfg, reporter=reporter)
-                logical_base_model_id = cfg.model.logical_base_model_id
-                if logical_base_model_id and not training_result.get("base_model_id"):
-                    training_result["base_model_id"] = logical_base_model_id
-                result["training"] = training_result
-
-            elif step_kind == "evaluation":
-                from .pipeline.eval_runner import run_evaluation
-
-                logger.info("==> starting evaluation")
-                evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
-                result["evaluation"] = evaluation_result
-
-            elif step_kind == "publish_hf":
-                reporter.report_status("running", message="Publishing to HF", stage="publish", progress=90)
-                hf_model_uploads = publisher.upload_to_huggingface(training_result)
-                if hf_model_uploads:
-                    result["uploads"].update(hf_model_uploads)
-
-                hf_metadata_uploads = publisher.upload_hf_metadata(
-                    log_file=str(log_file),
-                    effective_config_path=str(effective_config_path),
-                    result_path=str(result_path),
-                    training_result=training_result,
-                    eval_result=evaluation_result,
-                )
-                if hf_metadata_uploads:
-                    result["uploads"].update(hf_metadata_uploads)
-
-            elif step_kind == "upload_artifacts":
-                reporter.report_status("running", message="Uploading artifacts", stage="upload", progress=95)
-                extra_uploads, extra_upload_errors = uploader.upload_non_summary_artifacts(
-                    log_file=str(log_file),
-                    effective_config_path=str(effective_config_path),
-                    training_result=training_result,
-                    eval_result=evaluation_result,
-                )
-                if extra_uploads:
-                    result["uploads"].update(extra_uploads)
-                if extra_upload_errors:
-                    result["upload_errors"].update(extra_upload_errors)
-
-        if has_steps:
-            for step in pipeline.steps:
-                if step.enabled:
-                    run_step(step.key, step.kind)
-                else:
-                    logger.info("==> step %s disabled, skipping", step.key)
-        else:
-            if not pipeline or pipeline.prepare_assets.enabled:
-                run_step("prepare_assets", "prepare_assets")
-
-            if not pipeline or pipeline.training.enabled:
-                run_step("training", "training")
-
-            if (pipeline.evaluation.enabled if pipeline else cfg.evaluation.enabled):
-                run_step("evaluation", "evaluation")
-
-            if (pipeline.publish.enabled if pipeline else cfg.huggingface.enabled):
-                run_step("publish", "publish_hf")
-
-            if (pipeline.upload.enabled if pipeline else cfg.upload.enabled):
-                run_step("upload", "upload_artifacts")
-
-        result["finished_at"] = utc_now_iso()
-        write_json(result_path, result)
-
-        should_upload = pipeline.upload.enabled if pipeline else cfg.upload.enabled
-        if should_upload and cfg.upload.target == "url" and cfg.upload.url_targets.summary_url:
-            try:
-                summary_upload = uploader.upload_summary(str(result_path))
-                if summary_upload:
-                    result["uploads"].update(summary_upload)
-                    write_json(result_path, result)
-            except Exception as exc:
-                logger.exception("summary upload failed")
-                result["upload_errors"]["summary"] = str(exc)
-                write_json(result_path, result)
-
-        if result["upload_errors"]:
-            logger.warning("==> pipeline finished with upload warnings")
-            for key, value in result["upload_errors"].items():
-                logger.warning("==> upload warning [%s]: %s", key, value)
-
-        logger.info("==> pipeline finished successfully")
-        reporter.report_status(
-            "finished",
-            message=(
-                "Training pipeline finished successfully"
-                if not result["upload_errors"]
-                else "Training completed, but some URL artifact uploads failed"
-            ),
-            stage="finished",
-            progress=100,
-        )
-        reporter.report_final(result, status="finished")
-
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-        return result
-
-    except Exception as exc:
-        error_msg = str(exc)
-        stack_trace = traceback.format_exc()
-
-        logger.error("FATAL ERROR: %s", error_msg)
-        logger.error(stack_trace)
-
-        logs_tail = tail_file(log_file, 50)
-
-        failed_result = {
-            "status": "failed",
-            "job_id": cfg.job_id or cfg.job_name,
-            "job_name": cfg.job_name,
-            "run_name": run_name,
-            "started_at": started_at,
-            "finished_at": utc_now_iso(),
-            "config_source": config_source,
-            "error": error_msg,
-            "artifacts": {
-                "run_root": str(run_root),
-                "log_file": str(log_file),
-                "effective_config_path": str(effective_config_path),
-                "result_path": str(result_path),
-            },
-        }
-        write_json(result_path, failed_result)
-
-        reporter.report_error(error_msg, logs=logs_tail)
-        reporter.report_final(failed_result, status="failed")
-        return failed_result
-
-    finally:
-        stop_heartbeat(heartbeat_stop, heartbeat_thread)
-        try:
-            reporter.close()
-        except Exception:
-            pass
-        teardown_logging(handlers)
-        cleanup_runtime()
+    cleanup_runtime("previous-job")
+    pipeline = Pipeline(cfg, config_source, bootstrap_meta)
+    return pipeline.run()
 
 
 def main():
@@ -3821,8 +4195,10 @@ def main():
             summary_root = Path(cfgs[0].outputs.base_dir)
             results = []
             for index, cfg in enumerate(cfgs, start=1):
+                cleanup_runtime(f"before-batch-job-{index}")
                 print(f"==> batch job {index}/{len(cfgs)}: {cfg.job_name}")
                 results.append(run_single_job(cfg, config_source, {}))
+                cleanup_runtime(f"after-batch-job-{index}")
     except Exception as exc:
         print(f"ERROR: failed to execute jobs: {exc}")
         sys.exit(1)
@@ -3865,512 +4241,226 @@ path: /app/tests/test_remote_flow.py
 ----------------------------------------
 import json
 import sys
-import unittest
+import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
+# Mock heavy dependencies
 sys.modules["unsloth"] = MagicMock()
 sys.modules["torch"] = MagicMock()
 sys.modules["datasets"] = MagicMock()
 sys.modules["transformers"] = MagicMock()
 sys.modules["trl"] = MagicMock()
 
-import runner
-from schemas import JobConfig
+from app import runner
+from app.bootstrap.schemas import JobConfig
 
-
-class TestRemoteFlow(unittest.TestCase):
-    def setUp(self):
-        self.config_dict = {
-            "job_id": "job-test-001",
-            "job_name": "test-job",
-            "mode": "remote",
-            "model": {
-                "source": "local",
-                "local_path": "/app",
-                "repo_id": "Qwen/Qwen2.5-7B-Instruct",
-                "base_model": "Qwen/Qwen2.5-7B-Instruct",
-                "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
-            },
-            "dataset": {
-                "source": "url",
-                "train_url": "http://example.com/train.json",
-                "val_url": "http://example.com/val.json",
-            },
-            "training": {
-                "method": "lora",
-            },
-            "lora": {
-                "target_modules": ["q_proj", "v_proj"],
-            },
-            "outputs": {
-                "base_dir": "test_outputs",
-                "logs_dir": "test_outputs/logs",
-                "lora_dir": "test_outputs/lora",
-                "checkpoints_dir": "test_outputs/checkpoints",
-                "metrics_dir": "test_outputs/metrics",
-                "merged_dir": "test_outputs/merged",
-                "quantized_dir": "test_outputs/quantized",
-                "eval_dir": "test_outputs/evaluation",
-                "downloads_dir": "test_outputs/downloads",
-            },
-            "postprocess": {
-                "merge_lora": True,
-            },
-            "upload": {
-                "enabled": True,
-                "target": "url",
-                "upload_url": "http://example.com/upload",
-                "url_targets": {
-                    "summary_url": "http://example.com/upload/summary",
-                    "logs_url": "http://example.com/upload/logs",
-                    "merged_archive_url": "http://example.com/upload/merged",
-                },
-            },
-            "report_url": "http://example.com/report",
-        }
-        self.cfg = JobConfig.model_validate(self.config_dict)
-
-    @patch("runner.load_config")
-    @patch("runner.Reporter")
-    @patch("runner.AssetManager")
-    @patch("runner.Archiver")
-    @patch("runner.ArtifactUploader")
-    @patch("runner.run_training")
-    @patch("runner.try_hf_login")
-    @patch("runner.setup_logging")
-    @patch("pathlib.Path.open", mock_open())
-    def test_full_pipeline_success(
-        self,
-        mock_path_open,
-        mock_setup_logging,
-        mock_hf_login,
-        mock_run_training,
-        mock_uploader_cls,
-        mock_archiver_cls,
-        mock_asset_manager_cls,
-        mock_reporter_cls,
-        mock_load_config,
-    ):
-        mock_load_config.return_value = self.cfg
-        mock_setup_logging.return_value = Path("test_outputs/logs/trainer.log")
-        mock_run_training.return_value = {
-            "status": "success",
-            "job_name": self.cfg.job_name,
-            "base_model": "/app",
-            "base_model_id": "Qwen/Qwen2.5-7B-Instruct",
+@pytest.fixture
+def config_dict():
+    return {
+        "job_id": "job-test-001",
+        "job_name": "test-job",
+        "mode": "remote",
+        "model": {
+            "source": "local",
+            "local_path": "/app",
+            "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+            "base_model": "Qwen/Qwen2.5-7B-Instruct",
             "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
-            "lora_dir": "test_outputs/lora/test-job",
-            "merged_dir": "test_outputs/merged/test-job",
-            "checkpoint_dir": "test_outputs/checkpoints/test-job",
-            "metrics_path": "test_outputs/metrics/test-job.train_metrics.json",
-            "history_path": "test_outputs/metrics/test-job.train_history.json",
-            "train_summary_path": "test_outputs/metrics/test-job.train_summary.json",
-            "summary": {"train_loss": 1.23},
-        }
+        },
+        "dataset": {
+            "source": "url",
+            "train_url": "http://example.com/train.json",
+            "val_url": "http://example.com/val.json",
+        },
+        "training": {
+            "method": "lora",
+        },
+        "lora": {
+            "target_modules": ["q_proj", "v_proj"],
+        },
+        "outputs": {
+            "base_dir": "test_outputs",
+        },
+        "postprocess": {
+            "merge_lora": True,
+        },
+        "upload": {
+            "enabled": True,
+            "target": "url",
+            "upload_url": "http://example.com/upload",
+            "url_targets": {
+                "summary_url": "http://example.com/upload/summary",
+                "logs_url": "http://example.com/upload/logs",
+                "merged_archive_url": "http://example.com/upload/merged",
+            },
+        },
+        "report_url": "http://example.com/report",
+    }
 
-        mock_uploader = mock_uploader_cls.return_value
-        mock_uploader.ensure_hf_ready.return_value = {}
-        mock_uploader.upload_non_summary_artifacts.return_value = (
-            {"logs": {"url": "http://example.com/upload/logs", "path": "trainer.log"}},
-            {},
-        )
-        mock_uploader.upload_to_huggingface.return_value = {}
-        mock_uploader.upload_hf_metadata.return_value = {}
-        mock_uploader.upload_summary.return_value = {
-            "summary": {"url": "http://example.com/upload/summary", "path": "job-result.json"}
-        }
+@patch("app.runner.resolve_config_list")
+@patch("app.runner.Reporter")
+@patch("app.runner.AssetManager")
+@patch("app.runner.UploadRunner")
+@patch("app.runner.PublishRunner")
+@patch("app.pipeline.train_runner.run_training")
+@patch("app.runner.try_hf_login")
+@patch("app.runner.setup_logging")
+@patch("pathlib.Path.open", new_callable=mock_open)
+@patch("app.runner.write_json")
+def test_full_pipeline_success(
+    mock_write_json,
+    mock_path_open,
+    mock_setup_logging,
+    mock_hf_login,
+    mock_run_training,
+    mock_publish_runner_cls,
+    mock_upload_runner_cls,
+    mock_asset_manager_cls,
+    mock_reporter_cls,
+    mock_resolve_config_list,
+    config_dict
+):
+    cfg = JobConfig.model_validate(config_dict)
+    mock_resolve_config_list.return_value = ([cfg], "http://example.com/config.json")
+    mock_setup_logging.return_value = (Path("test_outputs/logs/trainer.log"), [])
 
-        with patch("sys.argv", ["runner.py", "--config", "http://example.com/config.json"]):
-            runner.main()
+    mock_run_training.return_value = {
+        "status": "success",
+        "job_name": cfg.job_name,
+        "lora_dir": "test_outputs/lora/test-job",
+        "merged_dir": "test_outputs/merged/test-job",
+    }
 
-        reporter = mock_reporter_cls.return_value
-        reporter.report_status.assert_any_call(
-            "started",
-            message="Training pipeline started",
-            stage="bootstrap",
-            progress=0,
-        )
-        reporter.report_status.assert_any_call(
-            "finished",
-            message="Training pipeline finished successfully",
-            stage="finished",
-            progress=100,
-        )
-        reporter.report_final.assert_called_once()
+    mock_upload_runner = mock_upload_runner_cls.return_value
+    mock_upload_runner.upload_non_summary_artifacts.return_value = (
+        {"logs": {"url": "http://example.com/upload/logs", "path": "trainer.log"}},
+        {},
+    )
+    mock_upload_runner.upload_summary.return_value = {
+        "summary": {"url": "http://example.com/upload/summary", "path": "job-result.json"}
+    }
 
-        mock_asset_manager_cls.return_value.prepare_dataset.assert_called_once_with(self.cfg)
-        mock_asset_manager_cls.return_value.prepare_evaluation_dataset.assert_called_once_with(self.cfg)
+    mock_publish_runner = mock_publish_runner_cls.return_value
 
-        mock_archiver = mock_archiver_cls.return_value
-        mock_archiver.make_archive.assert_called_once()
-        mock_archiver.upload_archive.assert_called_once()
+    with patch("sys.argv", ["runner.py", "--config", "http://example.com/config.json"]):
+        runner.main()
 
-        mock_uploader.upload_non_summary_artifacts.assert_called_once()
-        mock_uploader.upload_summary.assert_called_once()
+    reporter = mock_reporter_cls.return_value
+    reporter.report_status.assert_any_call(
+        "started",
+        message="Training pipeline started",
+        stage="bootstrap",
+        progress=0,
+    )
+    reporter.report_status.assert_any_call(
+        "finished",
+        message="Training pipeline finished successfully",
+        stage="finished",
+        progress=100,
+    )
+    reporter.report_final.assert_called_once()
 
-    @patch("runner.load_config")
-    @patch("runner.Reporter")
-    @patch("runner.AssetManager")
-    @patch("runner.ArtifactUploader")
-    @patch("runner.Archiver")
-    @patch("runner.run_training")
-    @patch("runner.setup_logging")
-    @patch("pathlib.Path.open", mock_open())
-    def test_pipeline_failure(
-        self,
-        mock_path_open,
-        mock_setup_logging,
-        mock_run_training,
-        mock_archiver_cls,
-        mock_uploader_cls,
-        mock_asset_manager_cls,
-        mock_reporter_cls,
-        mock_load_config,
-    ):
-        mock_load_config.return_value = self.cfg
-        mock_setup_logging.return_value = Path("test_outputs/logs/trainer.log")
-        mock_run_training.side_effect = Exception("Training failed")
-
-        with patch("sys.argv", ["runner.py", "--config", "http://example.com/config.json"]):
-            with self.assertRaises(SystemExit) as cm:
-                runner.main()
-
-        self.assertEqual(cm.exception.code, 1)
-        mock_reporter_cls.return_value.report_error.assert_called_once_with(
-            "Training failed",
-            logs=unittest.mock.ANY,
-        )
-
-    @patch("runner.load_config")
-    @patch("runner.Reporter")
-    @patch("runner.AssetManager")
-    @patch("runner.ArtifactUploader")
-    @patch("runner.Archiver")
-    @patch("runner.run_training")
-    @patch("runner.try_hf_login")
-    @patch("runner.setup_logging")
-    @patch("pathlib.Path.open", mock_open())
-    def test_upload_failure_is_not_fatal(
-        self,
-        mock_path_open,
-        mock_setup_logging,
-        mock_hf_login,
-        mock_run_training,
-        mock_archiver_cls,
-        mock_uploader_cls,
-        mock_asset_manager_cls,
-        mock_reporter_cls,
-        mock_load_config,
-    ):
-        mock_load_config.return_value = self.cfg
-        mock_setup_logging.return_value = Path("test_outputs/logs/trainer.log")
-        mock_run_training.return_value = {
-            "status": "success",
-            "job_name": self.cfg.job_name,
-            "base_model": "/app",
-            "base_model_id": "Qwen/Qwen2.5-7B-Instruct",
-            "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
-            "lora_dir": "test_outputs/lora/test-job",
-            "merged_dir": "test_outputs/merged/test-job",
-            "checkpoint_dir": "test_outputs/checkpoints/test-job",
-            "metrics_path": "test_outputs/metrics/test-job.train_metrics.json",
-            "history_path": "test_outputs/metrics/test-job.train_history.json",
-            "train_summary_path": "test_outputs/metrics/test-job.train_summary.json",
-            "summary": {"train_loss": 1.23},
-        }
-
-        mock_uploader = mock_uploader_cls.return_value
-        mock_uploader.ensure_hf_ready.return_value = {}
-        mock_uploader.upload_non_summary_artifacts.return_value = (
-            {"logs": {"url": "http://example.com/upload/logs", "path": "trainer.log"}},
-            {"merged_archive": "SSL EOF"},
-        )
-        mock_uploader.upload_to_huggingface.return_value = {}
-        mock_uploader.upload_hf_metadata.return_value = {}
-        mock_uploader.upload_summary.return_value = {
-            "summary": {"url": "http://example.com/upload/summary", "path": "job-result.json"}
-        }
-
-        with patch("sys.argv", ["runner.py", "--config", "http://example.com/config.json"]):
-            runner.main()
-
-        reporter = mock_reporter_cls.return_value
-        reporter.report_final.assert_called_once()
-        final_call = reporter.report_final.call_args
-        final_payload = final_call.args[0]
-
-        self.assertEqual(final_call.kwargs["status"], "finished")
-        self.assertEqual(final_payload["status"], "success")
-        self.assertIn("merged_archive", final_payload["upload_errors"])
+    mock_asset_manager_cls.return_value.prepare_dataset.assert_called_once()
+    mock_upload_runner.upload_non_summary_artifacts.assert_called_once()
+    mock_upload_runner.upload_summary.assert_called_once()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-path: /bundle-code.js
+path: /app/tests/test_schemas.py
 ----------------------------------------
-#!/usr/bin/env node
-/**
- * bundle-code.js
- * Собирает весь текстовый код проекта в один файл, помечая секции путями.
- * - Рекурсивный обход
- * - Пропуск бинарных файлов (по содержимому)
- * - Игнор по .codebundleignore (gitignore-like)
- */
+import pytest
+import sys
+from unittest.mock import MagicMock
 
-const  fs = require("fs");
-const  fsp = require("fs/promises");
-const  path = require("path")
+# Mock heavy/missing dependencies
+sys.modules["torch"] = MagicMock()
+sys.modules["unsloth"] = MagicMock()
+sys.modules["datasets"] = MagicMock()
+sys.modules["transformers"] = MagicMock()
+sys.modules["trl"] = MagicMock()
 
-const PROJECT_ROOT = process.cwd();
-const IGNORE_FILE_NAME = ".codebun)dleignore";
-const OUTPUT_FILE = path.join(PROJECT_ROOT, "codebundle.txt");
+from app.bootstrap.schemas import JobConfig, ModelConfig, DatasetConfig, TrainingConfig, LoraConfig, OutputsConfig
 
-const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
-const MAX_TOTAL_BYTES = 200 * 1024 * 1024;   // 200MB
-
-// Если заполнить — соберёт только эти расширения. Если пусто — любые текстовые.
-const ONLY_EXTENSIONS = new Set([
-  // ".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".scss", ".md", ".html", ".yml", ".yaml"
-]);
-
-function normalizeToPosix(p) {
-  return p.split(path.sep).join("/");
-}
-
-function stripBom(s) {
-  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
-}
-
-async function readIgnoreFile(ignorePath) {
-  try {
-    const raw = await fsp.readFile(ignorePath, "utf8");
-    return stripBom(raw)
-      .split(/\r?\n/)
-      .map(l => l.trim())
-      .filter(l => l && !l.startsWith("#"));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Компилируем игнор-правила.
- * Поддержка:
- * - "node_modules/" (игнор любой сегмент /node_modules/ в любом месте)
- * - "dist/" и т.п.
- * - "*.ext"
- * - "path/to/file" (точный относительный путь)
- * - "!pattern" (снять игнор)
- */
-function buildIgnoreMatcher(patterns) {
-  // дефолтные, чтобы не протекало даже если забыли
-  const defaultPatterns = [
-    "node_modules/",
-    ".git/",
-    "dist/",
-    "build/",
-    ".next/",
-    "coverage/",
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-  ];
-
-  const all = [...defaultPatterns, ...patterns];
-
-  const rules = all.map(p => ({
-    neg: p.startsWith("!"),
-    pat: (p.startsWith("!") ? p.slice(1) : p).trim(),
-  })).filter(r => r.pat);
-
-  function matchRule(relPosix, pat) {
-    // relPosix: "admin/node_modules/express/index.js"
-
-    // directory pattern: "node_modules/"
-    if (pat.endsWith("/")) {
-      const seg = pat.slice(0, -1);
-      if (!seg) return false;
-
-      // матч:
-      // - если путь начинается с seg/
-      // - или содержит /seg/ как сегмент
-      return (
-        relPosix === seg ||
-        relPosix.startsWith(seg + "/") ||
-        relPosix.includes("/" + seg + "/") ||
-        relPosix.endsWith("/" + seg)
-      );
+def test_minimal_config():
+    config_dict = {
+        "job_name": "test-job",
+        "model": {
+            "source": "huggingface",
+            "repo_id": "Qwen/Qwen2.5-7B-Instruct"
+        },
+        "dataset": {
+            "source": "local",
+            "train_path": "/data/train.json"
+        },
+        "training": {
+            "method": "lora"
+        },
+        "lora": {
+            "target_modules": ["q_proj", "v_proj"]
+        },
+        "outputs": {
+            "base_dir": "/output"
+        }
     }
+    config = JobConfig.model_validate(config_dict)
+    assert config.job_name == "test-job"
+    assert config.model.repo_id == "Qwen/Qwen2.5-7B-Instruct"
 
-    // glob extension: "*.png"
-    if (pat.startsWith("*.") && !pat.includes("/")) {
-      const ext = pat.slice(1); // ".png"
-      return relPosix.toLowerCase().endsWith(ext.toLowerCase());
-    }
+def test_invalid_model_config():
+    with pytest.raises(ValueError):
+        ModelConfig(source="local", local_path=None)
 
-    // exact file path
-    return relPosix === pat;
-  }
+def test_invalid_dataset_config():
+    with pytest.raises(ValueError):
+        DatasetConfig(source="url", train_url=None)
 
-  return function isIgnored(relPosix) {
-    let ignored = false;
-    for (const r of rules) {
-      if (matchRule(relPosix, r.pat)) {
-        ignored = !r.neg; // если negation — снимаем игнор
-      }
-    }
-    return ignored;
-  };
-}
+def test_outputs_fill_defaults():
+    outputs = OutputsConfig(base_dir="/output")
+    assert outputs.logs_dir == "/output/logs"
+    assert outputs.lora_dir == "/output/lora"
 
-async function isProbablyBinary(filePath) {
-  const fd = await fsp.open(filePath, "r");
-  try {
-    const { size } = await fd.stat();
-    const toRead = Math.min(size, 8192);
-    const buf = Buffer.allocUnsafe(toRead);
-    const { bytesRead } = await fd.read(buf, 0, toRead, 0);
-    if (bytesRead === 0) return false;
+def test_logical_base_model_id():
+    m = ModelConfig(source="huggingface", repo_id="Qwen/Qwen2.5-7B-Instruct")
+    assert m.logical_base_model_id == "Qwen/Qwen2.5-7B-Instruct"
 
-    let nulCount = 0;
-    let weirdCount = 0;
-    for (let i = 0; i < bytesRead; i++) {
-      const b = buf[i];
-      if (b === 0) nulCount++;
-      const ok =
-        b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126) || b >= 128;
-      if (!ok) weirdCount++;
-    }
-    if (nulCount > 0) return true;
-    return (weirdCount / bytesRead) > 0.25;
-  } finally {
-    await fd.close();
-  }
-}
+    m = ModelConfig(source="local", local_path="/app/model", base_model="Qwen/Qwen2.5-7B-Instruct")
+    assert m.logical_base_model_id == "Qwen/Qwen2.5-7B-Instruct"
 
-async function* walk(dirAbs, isIgnored) {
-  let entries;
-  try {
-    entries = await fsp.readdir(dirAbs, { withFileTypes: true });
-  } catch {
-    return;
-  }
+    m = ModelConfig(source="local", local_path="/app/model")
+    assert m.logical_base_model_id is None
 
-  entries.sort((a, b) => a.name.localeCompare(b.name));
 
-  for (const ent of entries) {
-    const abs = path.join(dirAbs, ent.name);
-    const rel = path.relative(PROJECT_ROOT, abs);
-    const relPosix = normalizeToPosix(rel);
+path: /app/tests/test_utils.py
+----------------------------------------
+import pytest
+from app.pipeline.utils import retry
+from unittest.mock import MagicMock
 
-    // не включаем output и ignore файл
-    if (path.resolve(abs) === path.resolve(OUTPUT_FILE)) continue;
-    if (relPosix === IGNORE_FILE_NAME) continue;
+def test_retry_success():
+    mock_func = MagicMock(return_value="success")
+    decorated = retry(tries=3, delay=0.1)(mock_func)
+    result = decorated()
+    assert result == "success"
+    assert mock_func.call_count == 1
 
-    if (isIgnored(relPosix)) continue;
+def test_retry_eventual_success():
+    mock_func = MagicMock(side_effect=[ValueError("fail"), "success"])
+    decorated = retry(exceptions=(ValueError,), tries=3, delay=0.1)(mock_func)
+    result = decorated()
+    assert result == "success"
+    assert mock_func.call_count == 2
 
-    if (ent.isDirectory()) {
-      yield* walk(abs, isIgnored);
-    } else if (ent.isFile()) {
-      yield { abs, relPosix };
-    }
-  }
-}
-
-async function bundle() {
-  const ignorePath = path.join(PROJECT_ROOT, IGNORE_FILE_NAME);
-  const patterns = await readIgnoreFile(ignorePath);
-  const isIgnored = buildIgnoreMatcher(patterns);
-
-  const out = fs.createWriteStream(OUTPUT_FILE, { encoding: "utf8" });
-
-  let totalBytes = 0;
-  let included = 0;
-  let skippedBinary = 0;
-  let skippedSize = 0;
-  let skippedExt = 0;
-
-  out.write(`=== CODE BUNDLE ===\n`);
-  out.write(`root: ${normalizeToPosix(PROJECT_ROOT)}\n`);
-  out.write(`ignore: ${IGNORE_FILE_NAME}\n`);
-  out.write(`generated: ${new Date().toISOString()}\n\n`);
-
-  for await (const file of walk(PROJECT_ROOT, isIgnored)) {
-    const ext = path.extname(file.relPosix).toLowerCase();
-    if (ONLY_EXTENSIONS.size && !ONLY_EXTENSIONS.has(ext)) {
-      skippedExt++;
-      continue;
-    }
-
-    let stat;
-    try {
-      stat = await fsp.stat(file.abs);
-    } catch {
-      continue;
-    }
-
-    if (stat.size > MAX_FILE_SIZE_BYTES) {
-      skippedSize++;
-      continue;
-    }
-    if (totalBytes + stat.size > MAX_TOTAL_BYTES) {
-      out.write(`\n\n=== STOP: total size limit reached (${MAX_TOTAL_BYTES} bytes) ===\n`);
-      break;
-    }
-
-    let binary;
-    try {
-      binary = await isProbablyBinary(file.abs);
-    } catch {
-      continue;
-    }
-    if (binary) {
-      skippedBinary++;
-      continue;
-    }
-
-    let content;
-    try {
-      content = await fsp.readFile(file.abs, "utf8");
-    } catch {
-      continue;
-    }
-
-    out.write(`\n\npath: /${file.relPosix}\n`);
-    out.write(`----------------------------------------\n`);
-    out.write(content);
-    if (!content.endsWith("\n")) out.write("\n");
-
-    totalBytes += stat.size;
-    included++;
-  }
-
-  out.write(`\n\n=== SUMMARY ===\n`);
-  out.write(`included: ${included}\n`);
-  out.write(`skipped(binary): ${skippedBinary}\n`);
-  out.write(`skipped(size): ${skippedSize}\n`);
-  out.write(`skipped(ext): ${skippedExt}\n`);
-  out.write(`totalBytes(approx): ${totalBytes}\n`);
-
-  await new Promise((res, rej) => {
-    out.end(res);
-    out.on("error", rej);
-  });
-
-  console.log(`Done. Output: ${OUTPUT_FILE}`);
-}
-
-bundle().catch(err => {
-  console.error("Error:", err);
-  process.exitCode = 1;
-});
+def test_retry_failure():
+    mock_func = MagicMock(side_effect=ValueError("fail"))
+    decorated = retry(exceptions=(ValueError,), tries=3, delay=0.1)(mock_func)
+    with pytest.raises(ValueError):
+        decorated()
+    assert mock_func.call_count == 3
 
 
 path: /docker/Dockerfile
 ----------------------------------------
+# Base image with CUDA and python
 ARG BASE_IMAGE=igortet/model-qwen-7b
 FROM ${BASE_IMAGE}
 
@@ -4382,9 +4472,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/cache/huggingface \
     TRANSFORMERS_CACHE=/cache/huggingface \
     HUGGINGFACE_HUB_CACHE=/cache/huggingface \
-    HF_HUB_DISABLE_TELEMETRY=1
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    VLLM_PYTHON_BIN=/opt/vllm-venv/bin/python
 
-RUN apt-get update && apt-get install -y \
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
@@ -4398,31 +4490,32 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /trainer
 
-COPY requirements.txt /trainer/requirements.txt
-COPY requirements.vllm.txt /trainer/requirements.vllm.txt
+# Copy requirement files first for better caching
+COPY requirements.txt requirements.vllm.txt /trainer/
+
+# Copy local wheels if any (empty if none)
 COPY packages /trainer/packages
 COPY docker/install_with_local_wheels.sh /trainer/install_with_local_wheels.sh
+RUN chmod +x /trainer/install_with_local_wheels.sh
 
-RUN chmod +x /trainer/install_with_local_wheels.sh && \
-    mkdir -p /trainer/packages/pip && \
-    echo "==> copied local wheels:" && \
-    find /trainer/packages/pip -maxdepth 1 -type f -name '*.whl' | sort | head -200
+# Setup training virtual environment
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install -U pip setuptools wheel && \
+    /trainer/install_with_local_wheels.sh /opt/venv/bin/python --requirements /trainer/requirements.txt /trainer/packages/pip
 
-# train env
-RUN python3 -m venv /opt/venv
-RUN /opt/venv/bin/pip install -U pip setuptools wheel
-RUN /trainer/install_with_local_wheels.sh /opt/venv/bin/python --requirements /trainer/requirements.txt /trainer/packages/pip
+# Setup separate vLLM virtual environment
+RUN python3 -m venv /opt/vllm-venv && \
+    /opt/vllm-venv/bin/pip install -U pip setuptools wheel && \
+    /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --requirements /trainer/requirements.vllm.txt /trainer/packages/pip
 
-# separate vLLM env
-RUN python3 -m venv /opt/vllm-venv
-RUN /opt/vllm-venv/bin/pip install -U pip setuptools wheel
-RUN /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --requirements /trainer/requirements.vllm.txt /trainer/packages/pip
-
+# Copy application code
 COPY app /trainer/app
 COPY docker/entrypoint.sh /trainer/entrypoint.sh
+RUN chmod +x /trainer/entrypoint.sh
 
-RUN chmod +x /trainer/entrypoint.sh && \
-    mkdir -p /output /cache/huggingface
+# Final setup
+RUN mkdir -p /output /cache/huggingface && \
+    chmod -R 777 /output /cache/huggingface
 
 ENTRYPOINT ["/trainer/entrypoint.sh"]
 
@@ -4485,7 +4578,7 @@ path: /docker/install_with_local_wheels.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -lt 2 ]; then
+if [ "$#" -lt 3 ]; then
   echo "Usage:"
   echo "  install_with_local_wheels.sh <python_bin> --requirements <file> [wheel_dir]"
   echo "  install_with_local_wheels.sh <python_bin> --package <spec_or_requirements_file> [wheel_dir]"
@@ -4504,32 +4597,87 @@ fi
 
 mkdir -p "${WHEEL_DIR}"
 
-echo "==> offline install"
+echo "==> install mode: local-first, internet fallback"
 echo "==> python: ${PYTHON_BIN}"
 echo "==> wheel dir: ${WHEEL_DIR}"
 find "${WHEEL_DIR}" -maxdepth 1 -type f -name '*.whl' | sort || true
 
-if ! find "${WHEEL_DIR}" -maxdepth 1 -type f -name '*.whl' | grep -q .; then
-  echo "ERROR: no local wheels found in ${WHEEL_DIR}"
-  exit 1
+TMP_WHEEL_LIST="$(mktemp)"
+trap 'rm -f "${TMP_WHEEL_LIST}"' EXIT
+
+# Выбираем только совместимые с текущим Python/ABI/platform колёса.
+# Если для одного пакета есть несколько версий, берём самую новую локальную.
+"${PYTHON_BIN}" - "${WHEEL_DIR}" > "${TMP_WHEEL_LIST}" <<'PY'
+import sys
+from pathlib import Path
+
+from pip._vendor.packaging.tags import sys_tags
+from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
+from pip._vendor.packaging.version import Version
+
+wheel_dir = Path(sys.argv[1])
+supported_tags = set(sys_tags())
+best = {}
+
+for wheel_path in sorted(wheel_dir.glob("*.whl")):
+    try:
+        name, version, build_tag, tags = parse_wheel_filename(wheel_path.name)
+    except Exception:
+        continue
+
+    if not (set(tags) & supported_tags):
+        continue
+
+    key = canonicalize_name(str(name))
+    version_obj = Version(str(version))
+
+    prev = best.get(key)
+    if prev is None or version_obj > prev[0]:
+        best[key] = (version_obj, wheel_path)
+
+for key in sorted(best):
+    print(str(best[key][1]))
+PY
+
+mapfile -t LOCAL_WHEELS < "${TMP_WHEEL_LIST}"
+
+echo "==> compatible local wheels selected: ${#LOCAL_WHEELS[@]}"
+for wheel in "${LOCAL_WHEELS[@]:0:200}"; do
+  echo "==> selected: ${wheel}"
+done
+
+# Шаг 1. Предустанавливаем всё, что нашли локально.
+# Без зависимостей, чтобы сначала максимально насытить env локальными wheel-файлами.
+if [ "${#LOCAL_WHEELS[@]}" -gt 0 ]; then
+  "${PYTHON_BIN}" -m pip install \
+    --no-index \
+    --no-deps \
+    --prefer-binary \
+    "${LOCAL_WHEELS[@]}" \
+    --break-system-packages
+else
+  echo "==> no compatible local wheels found, will use internet only"
 fi
 
+COMMON_ARGS=(
+  --find-links "${WHEEL_DIR}"
+  --prefer-binary
+  --upgrade-strategy only-if-needed
+  --break-system-packages
+)
+
+# Шаг 2. Доставляем недостающее.
+# Pip сначала использует уже установленные пакеты, потом wheelhouse, и только потом интернет.
 if [ "${MODE}" = "--requirements" ]; then
-  echo "==> installing from requirements file: ${TARGET}"
+  echo "==> resolving requirements with local-first fallback: ${TARGET}"
   "${PYTHON_BIN}" -m pip install \
-    --no-index \
-    --find-links "${WHEEL_DIR}" \
-    --prefer-binary \
-    -r "${TARGET}" \
-    --break-system-packages
+    "${COMMON_ARGS[@]}" \
+    -r "${TARGET}"
 elif [ "${MODE}" = "--package" ]; then
-  echo "==> installing package/spec: ${TARGET}"
+  echo "==> resolving package with local-first fallback: ${TARGET}"
   "${PYTHON_BIN}" -m pip install \
-    --no-index \
-    --find-links "${WHEEL_DIR}" \
-    --prefer-binary \
-    "${TARGET}" \
-    --break-system-packages
+    "${COMMON_ARGS[@]}" \
+    "${TARGET}"
 else
   echo "ERROR: unsupported mode ${MODE}"
   exit 1
@@ -4632,615 +4780,6 @@ services:
     gpus: all
     shm_size: "16gb"
     restart: "no"
-
-
-path: /docs/api_contract.md
-----------------------------------------
-## 1. Callback: status
-
-Используется для крупных смен стадий:
-
-* started
-* running
-* finished
-* failed
-
-### Endpoint
-
-`POST /api/jobs/status`
-
-### Тело запроса
-
-```json
-{
-  "job_id": "job_qwen25_05b_demo_remote",
-  "job_name": "qwen25-05b-demo-remote",
-  "event": "status",
-  "timestamp": 1773926400.123,
-  "status": "running",
-  "stage": "prepare_assets",
-  "progress": 5,
-  "message": "Preparing datasets and remote assets",
-  "logs": null,
-  "extra": {}
-}
-```
-
-### Поля
-
-```json
-{
-  "job_id": "string",
-  "job_name": "string",
-  "event": "status",
-  "timestamp": "number (unix seconds)",
-  "status": "started | running | finished | failed",
-  "stage": "string | null",
-  "progress": "number 0..100 | null",
-  "message": "string | null",
-  "logs": "string | null",
-  "extra": "object"
-}
-```
-
-### Что backend должен делать
-
-* находить job по `job_id`
-* обновлять:
-
-  * общий статус
-  * текущую стадию
-  * progress
-  * last_message
-  * updated_at
-* если `status=failed`, сохранить `logs` как diagnostic tail
-
-### Ответ
-
-```json
-{
-  "ok": true
-}
-```
-
----
-
-## 2. Callback: progress
-
-Используется часто, для живого прогресса во время train/eval.
-
-### Endpoint
-
-`POST /api/jobs/progress`
-
-### Тело запроса
-
-```json
-{
-  "job_id": "job_qwen25_05b_demo_remote",
-  "job_name": "qwen25-05b-demo-remote",
-  "event": "progress",
-  "timestamp": 1773926412.456,
-  "status": "running",
-  "stage": "training",
-  "progress": 37.5,
-  "message": "trainer log",
-  "extra": {
-    "step": 120,
-    "epoch": 0.42,
-    "loss": 1.1834,
-    "grad_norm": 0.91,
-    "learning_rate": 0.000082
-  }
-}
-```
-
-### Поля
-
-```json
-{
-  "job_id": "string",
-  "job_name": "string",
-  "event": "progress",
-  "timestamp": "number",
-  "status": "running",
-  "stage": "string",
-  "progress": "number 0..100 | null",
-  "message": "string | null",
-  "extra": "object"
-}
-```
-
-### Что backend должен делать
-
-* обновлять live progress
-* писать историю progress events в отдельную таблицу или log stream
-* по желанию агрегировать последние train metrics в UI
-
----
-
-## 3. Callback: final
-
-Финальный результат job целиком.
-
-### Endpoint
-
-`POST /api/jobs/final`
-
-### Тело запроса при успехе
-
-```json
-{
-  "job_id": "job_qwen25_05b_demo_remote",
-  "job_name": "qwen25-05b-demo-remote",
-  "event": "final",
-  "timestamp": 1773926999.111,
-  "status": "finished",
-  "result": {
-    "status": "success",
-    "job_id": "job_qwen25_05b_demo_remote",
-    "job_name": "qwen25-05b-demo-remote",
-    "started_at": "2026-03-19T13:00:00+00:00",
-    "finished_at": "2026-03-19T13:09:59+00:00",
-    "config_source": "https://example.com/job.json",
-    "training": {
-      "status": "success",
-      "job_name": "qwen25-05b-demo-remote",
-      "base_model": "/models/qwen25-05b",
-      "lora_dir": "/output/qwen25-05b-demo-remote/lora/qwen25-05b-demo-remote",
-      "merged_dir": "/output/qwen25-05b-demo-remote/merged/qwen25-05b-demo-remote",
-      "checkpoint_dir": "/output/qwen25-05b-demo-remote/checkpoints/qwen25-05b-demo-remote",
-      "metrics_path": "/output/qwen25-05b-demo-remote/metrics/qwen25-05b-demo-remote.train_metrics.json",
-      "history_path": "/output/qwen25-05b-demo-remote/metrics/qwen25-05b-demo-remote.train_history.json",
-      "train_summary_path": "/output/qwen25-05b-demo-remote/metrics/qwen25-05b-demo-remote.train_summary.json",
-      "summary": {
-        "job_name": "qwen25-05b-demo-remote",
-        "train_rows": 10000,
-        "validation_rows": 500,
-        "method": "qlora",
-        "base_model": "/models/qwen25-05b",
-        "load_in_4bit": true,
-        "bf16": true,
-        "merged_saved": true,
-        "train_runtime": 522.4,
-        "train_samples_per_second": 19.1,
-        "train_steps_per_second": 0.52,
-        "train_loss": 0.947,
-        "final_loss": 0.913
-      }
-    },
-    "evaluation": {
-      "enabled": true,
-      "target": "auto",
-      "model": "/output/qwen25-05b-demo-remote/merged/qwen25-05b-demo-remote",
-      "summary": {
-        "model": "/output/qwen25-05b-demo-remote/merged/qwen25-05b-demo-remote",
-        "samples": 100,
-        "parseSuccessRate": 0.96,
-        "mae": 0.41,
-        "rmse": 0.67,
-        "exactRate": 0.58,
-        "within1Rate": 0.95,
-        "within2Rate": 1.0,
-        "meanSignedError": -0.08,
-        "avgPredictedScore": 3.82,
-        "parseErrors": 4,
-        "inferenceErrors": 0,
-        "emptyResponses": 1
-      },
-      "summary_json_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/summary.json",
-      "result_json_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/result.json",
-      "summary_csv_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/summary.csv",
-      "detailed_csv_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/detailed.csv"
-    },
-    "artifacts": {
-      "log_file": "/output/qwen25-05b-demo-remote/logs/trainer.log",
-      "effective_config_path": "/output/qwen25-05b-demo-remote/logs/effective-job.json",
-      "result_path": "/output/qwen25-05b-demo-remote/job-result.json"
-    },
-    "uploads": {
-      "logs": {
-        "url": "https://example.com/api/jobs/upload/logs",
-        "path": "/output/qwen25-05b-demo-remote/logs/trainer.log"
-      },
-      "lora_archive": {
-        "url": "https://example.com/api/jobs/upload/lora",
-        "archive_path": "/output/qwen25-05b-demo-remote/qwen25-05b-demo-remote.lora.tar.gz"
-      }
-    }
-  }
-}
-```
-
-### Тело запроса при ошибке
-
-```json
-{
-  "job_id": "job_qwen25_05b_demo_remote",
-  "job_name": "qwen25-05b-demo-remote",
-  "event": "final",
-  "timestamp": 1773926999.111,
-  "status": "failed",
-  "result": {
-    "status": "failed",
-    "job_id": "job_qwen25_05b_demo_remote",
-    "job_name": "qwen25-05b-demo-remote",
-    "started_at": "2026-03-19T13:00:00+00:00",
-    "finished_at": "2026-03-19T13:02:11+00:00",
-    "config_source": "https://example.com/job.json",
-    "error": "Evaluation dataset is empty after normalization",
-    "artifacts": {
-      "log_file": "/output/qwen25-05b-demo-remote/logs/trainer.log",
-      "effective_config_path": "/output/qwen25-05b-demo-remote/logs/effective-job.json",
-      "result_path": "/output/qwen25-05b-demo-remote/job-result.json"
-    }
-  }
-}
-```
-
-### Что backend должен делать
-
-* помечать job завершённым
-* сохранять итоговый payload целиком
-* разбирать `training.summary`
-* разбирать `evaluation.summary`
-* связывать загруженные артефакты с job
-
----
-
-## 4. Upload endpoints
-
-Runner отправляет файлы multipart/form-data.
-
-### Общий формат upload request
-
-`POST /api/jobs/upload/<artifact-type>`
-
-`Content-Type: multipart/form-data`
-
-Поля формы:
-
-* `job_id`
-* `job_name`
-* `artifact_type`
-* `file`
-
-### Пример
-
-Поле `file` содержит бинарник файла или tar.gz.
-
-### Универсальный ответ
-
-```json
-{
-  "ok": true,
-  "artifact_id": "art_123",
-  "job_id": "job_qwen25_05b_demo_remote",
-  "artifact_type": "lora_archive",
-  "storage_key": "jobs/job_qwen25_05b_demo_remote/lora.tar.gz",
-  "download_url": "https://cdn.example.com/jobs/job_qwen25_05b_demo_remote/lora.tar.gz"
-}
-```
-
----
-
-## 5. Какие upload endpoints нужны
-
-### Логи
-
-`POST /api/jobs/upload/logs`
-
-Принимает:
-
-* `trainer.log`
-
-Сохраняет как:
-
-* plain text log artifact
-
-### Effective config
-
-`POST /api/jobs/upload/config`
-
-Принимает:
-
-* `effective-job.json`
-
-Сохраняет как:
-
-* исходный эффективный конфиг job
-
-### Итоговый summary
-
-`POST /api/jobs/upload/summary`
-
-Принимает:
-
-* `job-result.json`
-
-Сохраняет как:
-
-* финальный канонический результат job
-
-### Train metrics
-
-`POST /api/jobs/upload/train-metrics`
-
-Принимает:
-
-* `*.train_metrics.json`
-
-### Train history
-
-`POST /api/jobs/upload/train-history`
-
-Принимает:
-
-* `*.train_history.json`
-
-### Eval summary
-
-`POST /api/jobs/upload/eval-summary`
-
-Принимает:
-
-* `summary.json` с метриками eval
-
-### Eval details
-
-`POST /api/jobs/upload/eval-details`
-
-Принимает:
-
-* `detailed.csv`
-
-### LoRA archive
-
-`POST /api/jobs/upload/lora`
-
-Принимает:
-
-* tar.gz с LoRA adapter
-
-### Merged archive
-
-`POST /api/jobs/upload/merged`
-
-Принимает:
-
-* tar.gz с merged model
-
-### Full archive
-
-`POST /api/jobs/upload/full-archive`
-
-Принимает:
-
-* tar.gz со всем output job
-
----
-
-## 6. Что лучше хранить в БД
-
-Минимальная таблица `jobs`:
-
-```json
-{
-  "id": "job_qwen25_05b_demo_remote",
-  "name": "qwen25-05b-demo-remote",
-  "status": "running",
-  "stage": "training",
-  "progress": 37.5,
-  "message": "trainer log",
-  "created_at": "timestamp",
-  "updated_at": "timestamp",
-  "started_at": "timestamp|null",
-  "finished_at": "timestamp|null",
-  "error": "string|null",
-  "result_json": "json|null"
-}
-```
-
-Таблица `job_events`:
-
-```json
-{
-  "id": "evt_xxx",
-  "job_id": "job_qwen25_05b_demo_remote",
-  "event": "status|progress|final",
-  "payload": "json",
-  "created_at": "timestamp"
-}
-```
-
-Таблица `job_artifacts`:
-
-```json
-{
-  "id": "art_xxx",
-  "job_id": "job_qwen25_05b_demo_remote",
-  "artifact_type": "logs|config|summary|train_metrics|train_history|eval_summary|eval_details|lora_archive|merged_archive|full_archive",
-  "filename": "string",
-  "storage_key": "string",
-  "download_url": "string|null",
-  "content_type": "string|null",
-  "size_bytes": "number|null",
-  "created_at": "timestamp"
-}
-```
-
----
-
-## 7. Рекомендуемая логика статусов
-
-Я бы использовал такой lifecycle:
-
-* `queued`
-* `started`
-* `running`
-* `finished`
-* `failed`
-
-И такие stage:
-
-* `bootstrap`
-* `hf_login`
-* `prepare_assets`
-* `load_model`
-* `load_dataset`
-* `training`
-* `save_lora`
-* `merge_lora`
-* `train_completed`
-* `evaluation_prepare`
-* `evaluation`
-* `evaluation_completed`
-* `finished`
-* `failed`
-
----
-
-## 8. Авторизация
-
-Лучше передавать bearer token в конфиге:
-
-```json
-{
-  "reporting": {
-    "status": {
-      "enabled": true,
-      "url": "https://example.com/api/jobs/status",
-      "auth": {
-        "bearer_token": "secret-token"
-      }
-    }
-  },
-  "upload": {
-    "enabled": true,
-    "target": "url",
-    "auth": {
-      "bearer_token": "secret-token"
-    }
-  }
-}
-```
-
-Backend должен принимать:
-
-```http
-Authorization: Bearer secret-token
-```
-
----
-
-## 9. Идемпотентность
-
-Полезно, чтобы backend спокойно переживал ретраи.
-
-Для этого:
-
-* `job_id` должен быть уникальным и приходить из твоего сервиса
-* повторный `status/progress/final` по тому же `job_id` не должен ломать запись
-* upload можно делать либо:
-
-  * overwrite по `(job_id, artifact_type)`
-  * либо versioned storage, но в БД держать “последнюю актуальную версию”
-
----
-
-## 10. Что я советую сделать на твоём backend сразу
-
-1. Один endpoint на status
-2. Один endpoint на progress
-3. Один endpoint на final
-4. Один универсальный upload endpoint вида
-   `POST /api/jobs/upload/:artifactType`
-5. В UI показывать:
-
-   * status
-   * stage
-   * progress
-   * train summary
-   * eval summary
-   * список артефактов
-
----
-
-## 11. Минимальный backend response contract
-
-Для всех callback endpoints:
-
-```json
-{
-  "ok": true
-}
-```
-
-Для всех upload endpoints:
-
-```json
-{
-  "ok": true,
-  "artifact_id": "art_xxx",
-  "download_url": "https://cdn.example.com/path/to/file"
-}
-```
-
-Коды:
-
-* `200` или `201` — успех
-* `400` — невалидный payload
-* `401/403` — auth error
-* `404` — job not found, если ты это хочешь строго контролировать
-* `500` — временная ошибка, runner попробует/сможет быть перезапущен на уровне orchestration
-
----
-
-## 12. Пример одной job-конфигурации с backend-контрактом
-
-```json
-{
-  "job_id": "job_20260319_001",
-  "job_name": "qwen25-math-v3",
-  "reporting": {
-    "status": {
-      "enabled": true,
-      "url": "https://api.example.com/jobs/status",
-      "auth": {
-        "bearer_token": "secret-token"
-      }
-    },
-    "progress": {
-      "enabled": true,
-      "url": "https://api.example.com/jobs/progress",
-      "auth": {
-        "bearer_token": "secret-token"
-      }
-    },
-    "final": {
-      "enabled": true,
-      "url": "https://api.example.com/jobs/final",
-      "auth": {
-        "bearer_token": "secret-token"
-      }
-    }
-  },
-  "upload": {
-    "enabled": true,
-    "target": "url",
-    "auth": {
-      "bearer_token": "secret-token"
-    },
-    "url_targets": {
-      "logs_url": "https://api.example.com/jobs/upload/logs",
-      "summary_url": "https://api.example.com/jobs/upload/summary",
-      "lora_archive_url": "https://api.example.com/jobs/upload/lora",
-      "merged_archive_url": "https://api.example.com/jobs/upload/merged",
-      "eval_summary_url": "https://api.example.com/jobs/upload/eval-summary",
-      "eval_details_url": "https://api.example.com/jobs/upload/eval-details"
-    }
-  }
-}
 
 
 path: /examples/job.local.json
@@ -5495,112 +5034,155 @@ path: /examples/job.remote.json
 }
 
 
-path: /packages/README.md
+path: /local-run/job.local.json
 ----------------------------------------
+{
+  "defaults": {
+    "mode": "local",
+    "model": {
+      "source": "local",
+      "local_path": "/app",
+      "trust_remote_code": false,
+      "load_in_4bit": true,
+      "dtype": "bfloat16",
+      "max_seq_length": 256
+    },
+    "training": {
+      "method": "qlora",
+      "max_seq_length": 256,
+      "per_device_train_batch_size": 1,
+      "gradient_accumulation_steps": 1,
+      "num_train_epochs": 1,
+      "learning_rate": 0.0001,
+      "warmup_ratio": 0.03,
+      "logging_steps": 1,
+      "save_steps": 10,
+      "eval_steps": 10,
+      "bf16": true,
+      "packing": false,
+      "save_total_limit": 1,
+      "optim": "adamw_8bit"
+    },
+    "lora": {
+      "r": 8,
+      "lora_alpha": 16,
+      "lora_dropout": 0.0,
+      "bias": "none",
+      "use_gradient_checkpointing": "unsloth",
+      "random_state": 3407,
+      "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]
+    },
+    "outputs": {
+      "base_dir": "/output"
+    },
+    "postprocess": {
+      "merge_lora": true,
+      "save_merged_16bit": true,
+      "run_awq_quantization": false
+    },
+    "evaluation": {
+      "enabled": true,
+      "engine": "vllm",
+      "target": "merged",
+      "batch_size": 1,
+      "max_num_seqs": 1,
+      "max_num_batched_tokens": 512,
+      "max_model_len": 512,
+      "tensor_parallel_size": 1,
+      "gpu_memory_utilization": 0.64,
+      "max_new_tokens": 8,
+      "temperature": 0.0,
+      "do_sample": false,
+      "score_min": 0.0,
+      "score_max": 5.0,
+      "parsing_regex": "^\\s*([0-5](?:\\.0)?)\\s*$",
+      "dataset": {
+        "source": "local",
+        "path": "/data/eval.jsonl",
+        "format": "jsonl",
+        "task": "score_prediction",
+        "prompt_field": "input",
+        "score_field": "output",
+        "tags_field": "details.hash"
+      }
+    },
+    "upload": {
+      "enabled": false
+    },
+    "huggingface": {
+      "enabled": false
+    },
+    "reporting": {
+      "status": { "enabled": false },
+      "progress": { "enabled": false },
+      "final": { "enabled": false },
+      "logs": { "enabled": false }
+    }
+  },
+  "jobs": [
+    {
+      "job_id": "local_run",
+      "job_name": "local-run",
+      "dataset": {
+        "source": "local",
+        "train_path": "/data/train.jsonl",
+        "format": "instruction_output",
+        "input_field": "input",
+        "output_field": "output"
+      },
+      "evaluation": {
+        "enabled": true,
+        "engine": "vllm",
+        "target": "merged",
+        "batch_size": 32,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 8192,
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "max_new_tokens": 8,
+        "temperature": 0.0,
+        "do_sample": false,
+        "score_min": 0.0,
+        "score_max": 5.0,
+        "parsing_regex": "^\\s*([0-5](?:\\.0)?)\\s*$",
+        "dataset": {
+          "source": "local",
+          "path": "/data/eval.jsonl",
+          "format": "jsonl",
+          "task": "score_prediction",
+          "prompt_field": "input",
+          "score_field": "output",
+          "tags_field": "details.hash"
+        }
+      }
+    }
+  ]
+}
 
 
-
-path: /README.md
+path: /local-run/run.sh
 ----------------------------------------
-# trainer-service
+#!/bin/bash
+set -e
 
-Одноразовый job-runner для fine-tuning на Vast.ai.
+# Убедимся, что папка для вывода существует
+mkdir -p ./output
 
-Сервис не хранит состояние как backend-приложение. Он запускается на один job, читает один JSON-конфиг, выполняет pipeline и выгружает наружу:
-- статусы;
-- прогресс;
-- логи;
-- LoRA;
-- merged model;
-- train metrics;
-- evaluation results.
-
-## Pipeline
-
-1. Загружает JSON-конфиг из локального файла или по URL.
-2. Логинится в Hugging Face по `HF_TOKEN`, если токен передан.
-3. При необходимости скачивает train/val/eval датасеты по URL.
-4. Запускает fine-tuning через Unsloth.
-5. Сохраняет LoRA adapter.
-6. Опционально сохраняет merged 16-bit модель.
-7. Опционально запускает evaluation после обучения.
-8. Опционально:
-   - пушит LoRA / merged model в Hugging Face;
-   - загружает артефакты по URL;
-   - отправляет callbacks со статусами и прогрессом.
-9. Сохраняет итог в `job-result.json`.
-
-## Ключевые требования, которые покрыты
-
-- Конфиг может лежать по URL.
-- Модель может быть уже встроена в Docker image (`model.source=local`).
-- Есть внешние callbacks для:
-  - started/running/finished/failed;
-  - progress;
-  - final result.
-- Есть отдельная выгрузка:
-  - logs;
-  - effective config;
-  - train metrics / history;
-  - eval summary / details;
-  - LoRA archive;
-  - merged archive;
-  - full archive.
-- Есть post-train evaluation с метриками:
-  - `model`
-  - `samples`
-  - `parseSuccessRate`
-  - `mae`
-  - `rmse`
-  - `exactRate`
-  - `within1Rate`
-  - `within2Rate`
-  - `meanSignedError`
-  - `avgPredictedScore`
-  - `parseErrors`
-  - `inferenceErrors`
-  - `emptyResponses`
-
-## Запуск
-
-### Через env
-
-```bash
-docker run --rm --gpus all \
-  -e HF_TOKEN=hf_xxx \
-  -e CONFIG_SOURCE=remote \
-  -e CONFIG_REF=https://example.com/job.json \
+# Запуск контейнера
+docker run -it --rm \
+  --gpus all \
+  --shm-size 16g \
+  -v $(pwd)/data:/data \
+  -v $(pwd)/job.local.json:/configs/job.local.json \
   -v $(pwd)/output:/output \
-  trainer-service
-
-
-path: /requirements.txt
-----------------------------------------
-unsloth
-unsloth-zoo
-
-bitsandbytes>=0.45.0
-xformers==0.0.35
-
-transformers>=4.48.0
-datasets>=3.6.0
-accelerate>=1.10.1
-trl>=0.19.0
-peft>=0.17.1
-sentencepiece>=0.2.1
-huggingface_hub[hf-xet]
-pydantic>=2.11.7
-requests>=2.32.3
-
-
-path: /requirements.vllm.txt
-----------------------------------------
-vllm
+  -e CONFIG_SOURCE=local \
+  -e CONFIG_REF=/configs/job.local.json \
+  igortet/itk-executor-trainer:latest
 
 
 === SUMMARY ===
 included: 37
-skipped(binary): 0
+skipped(binary): 21
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 169903
+totalBytes(approx): 165162

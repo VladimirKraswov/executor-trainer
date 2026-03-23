@@ -159,7 +159,6 @@ class Pipeline:
         self.bootstrap_meta = bootstrap_meta or {}
         self.run_name, self.run_root = apply_run_output_paths(self.cfg)
 
-        # Override config reporting with bootstrap meta if present
         if self.bootstrap_meta.get("status_url"):
             self.cfg.reporting.status.url = self.bootstrap_meta["status_url"]
             self.cfg.reporting.status.enabled = True
@@ -297,6 +296,12 @@ class Pipeline:
                 self.result["evaluation"] = self.evaluation_result
             except Exception as e:
                 logger.error("Evaluation failed but continuing: %s", e)
+                self.evaluation_result = {
+                    "enabled": True,
+                    "status": "failed",
+                    "error": str(e),
+                }
+                self.result["evaluation"] = self.evaluation_result
                 self.result["evaluation_error"] = str(e)
             cleanup_runtime("evaluation")
 
@@ -354,7 +359,13 @@ class Pipeline:
 
     def _finalize_success(self) -> None:
         self.result["finished_at"] = utc_now_iso()
-        self.result["status"] = "success"
+
+        evaluation_failed = bool(self.result.get("evaluation_error")) or (
+            isinstance(self.result.get("evaluation"), dict)
+            and self.result["evaluation"].get("status") == "failed"
+        )
+
+        self.result["status"] = "partial_failed" if evaluation_failed else "success"
         write_json(self.result_path, self.result)
 
         p = self.cfg.pipeline
@@ -370,17 +381,27 @@ class Pipeline:
                 self.result["upload_errors"]["summary"] = str(exc)
                 write_json(self.result_path, self.result)
 
-        if self.result["upload_errors"]:
-            logger.warning("==> pipeline finished with upload warnings")
+        if evaluation_failed or self.result["upload_errors"]:
+            logger.warning("==> pipeline finished with warnings")
+        else:
+            logger.info("==> pipeline finished successfully")
 
-        logger.info("==> pipeline finished successfully")
+        final_message = (
+            "Training pipeline finished with evaluation errors"
+            if evaluation_failed
+            else "Training pipeline finished successfully"
+        )
+
+        status_extra = {"evaluation_error": self.result.get("evaluation_error")} if evaluation_failed else {}
+
         self.reporter.report_status(
             "finished",
-            message="Training pipeline finished successfully",
+            message=final_message,
             stage="finished",
             progress=100,
+            extra=status_extra,
         )
-        self.reporter.report_final(self.result, status="finished")
+        self.reporter.report_final(self.result, status=self.result["status"])
 
     def _handle_error(self, exc: Exception) -> Dict[str, Any]:
         error_msg = str(exc)
@@ -468,15 +489,17 @@ def main():
     batch_finished_at = utc_now_iso()
     batch_started_at = min((r.get("started_at") for r in results if r.get("started_at")), default=batch_finished_at)
     success_count = sum(1 for r in results if r.get("status") == "success")
-    failed_count = sum(1 for r in results if r.get("status") != "success")
+    failed_count = sum(1 for r in results if r.get("status") == "failed")
+    partial_failed_count = sum(1 for r in results if r.get("status") == "partial_failed")
 
     batch_summary = {
-        "status": "success" if failed_count == 0 else "partial_failed",
+        "status": "success" if failed_count == 0 and partial_failed_count == 0 else "partial_failed",
         "started_at": batch_started_at,
         "finished_at": batch_finished_at,
         "total_jobs": len(results),
         "success_count": success_count,
         "failed_count": failed_count,
+        "partial_failed_count": partial_failed_count,
         "results": results,
     }
 
@@ -486,7 +509,7 @@ def main():
 
     print(json.dumps(batch_summary, indent=2, ensure_ascii=False))
 
-    if failed_count > 0:
+    if failed_count > 0 or partial_failed_count > 0:
         sys.exit(1)
 
 

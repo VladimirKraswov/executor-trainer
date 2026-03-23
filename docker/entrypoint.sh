@@ -34,7 +34,7 @@ if [ "${CONFIG_SOURCE}" = "remote" ]; then
     exit 1
   fi
 
-  exec python -m app.runner --config "${CONFIG_REF}"
+  exec python -m app.runner --job-config-url "${CONFIG_REF}"
 fi
 
 if [ -z "${CONFIG_REF}" ]; then
